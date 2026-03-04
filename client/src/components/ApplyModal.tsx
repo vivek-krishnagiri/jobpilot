@@ -1,0 +1,280 @@
+import { useState, useEffect, useCallback } from 'react';
+import clsx from 'clsx';
+import type { ApplySession, FillResult, SessionStatus } from '../types';
+import { startApplySession, fetchApplySession, triggerAutofill } from '../api/apply';
+
+// ─── Status helpers ───────────────────────────────────────────────────────────
+
+const STATUS_LABEL: Record<SessionStatus, string> = {
+  created:       'Starting…',
+  opening:       'Opening browser…',
+  open:          'Browser open — watching for application form…',
+  form_detected: 'Form detected — ready to autofill',
+  filling:       'Filling form…',
+  filled:        'Form filled',
+  error:         'Error',
+  closed:        'Session closed',
+};
+
+const STATUS_COLOR: Record<SessionStatus, string> = {
+  created:       'text-gray-500',
+  opening:       'text-indigo-500',
+  open:          'text-blue-500',
+  form_detected: 'text-emerald-600',
+  filling:       'text-indigo-500',
+  filled:        'text-emerald-600',
+  error:         'text-red-500',
+  closed:        'text-gray-400',
+};
+
+const POLLING_STATUSES: SessionStatus[] = ['created', 'opening', 'open'];
+
+// ─── Component ────────────────────────────────────────────────────────────────
+
+interface ApplyModalProps {
+  jobId: number;
+  jobTitle: string;
+  company: string;
+  onClose: () => void;
+}
+
+export default function ApplyModal({ jobId, jobTitle, company, onClose }: ApplyModalProps) {
+  const [session, setSession]       = useState<ApplySession | null>(null);
+  const [fillResult, setFillResult] = useState<FillResult | null>(null);
+  const [filling, setFilling]       = useState(false);
+  const [error, setError]           = useState<string | null>(null);
+
+  // Start session immediately on mount
+  useEffect(() => {
+    startApplySession(jobId)
+      .then(setSession)
+      .catch((err: unknown) => setError(err instanceof Error ? err.message : 'Failed to start session'));
+  }, [jobId]);
+
+  // Poll session status while in transient states
+  const poll = useCallback(async (id: number) => {
+    try {
+      const updated = await fetchApplySession(id);
+      setSession(updated);
+      return updated.status;
+    } catch {
+      return null;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!session) return;
+    if (!POLLING_STATUSES.includes(session.status)) return;
+
+    const interval = setInterval(async () => {
+      const status = await poll(session.id);
+      if (!status || !POLLING_STATUSES.includes(status)) {
+        clearInterval(interval);
+      }
+    }, 2000);
+
+    return () => clearInterval(interval);
+  }, [session, poll]);
+
+  const handleAutofill = async () => {
+    if (!session) return;
+    setFilling(true);
+    setError(null);
+    try {
+      const { session: updated, fillResult: result } = await triggerAutofill(session.id);
+      setSession(updated);
+      setFillResult(result);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Autofill failed');
+      // Refresh session to get error state
+      const updated = await fetchApplySession(session.id).catch(() => null);
+      if (updated) setSession(updated);
+    } finally {
+      setFilling(false);
+    }
+  };
+
+  const status = session?.status ?? 'created';
+  const isError = status === 'error' || !!error;
+  const canAutofill = status === 'form_detected' && !filling;
+  const isBusy = status === 'opening' || status === 'open' || status === 'filling' || filling;
+
+  return (
+    // Backdrop
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm"
+      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
+    >
+      {/* Modal card */}
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md mx-4 overflow-hidden">
+
+        {/* Header */}
+        <div className="flex items-start justify-between px-6 pt-5 pb-4 border-b border-gray-100">
+          <div>
+            <h2 className="text-base font-semibold text-gray-900">Apply with JobPilot</h2>
+            <p className="text-sm text-gray-500 mt-0.5">{jobTitle} · {company}</p>
+          </div>
+          <button
+            onClick={onClose}
+            className="text-gray-400 hover:text-gray-600 text-xl leading-none ml-4 mt-0.5"
+          >
+            ×
+          </button>
+        </div>
+
+        {/* Status */}
+        <div className="px-6 py-4">
+          <div className="flex items-center gap-2.5 mb-1">
+            {isBusy && (
+              <svg className="w-4 h-4 animate-spin text-indigo-500 shrink-0" fill="none" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+              </svg>
+            )}
+            {!isBusy && !isError && status === 'form_detected' && (
+              <div className="w-4 h-4 rounded-full bg-emerald-500 shrink-0" />
+            )}
+            {!isBusy && !isError && status === 'filled' && (
+              <svg className="w-4 h-4 text-emerald-500 shrink-0" fill="none" viewBox="0 0 24 24" strokeWidth={2.5} stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
+              </svg>
+            )}
+            {isError && (
+              <svg className="w-4 h-4 text-red-500 shrink-0" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
+              </svg>
+            )}
+            <span className={clsx('text-sm font-medium', STATUS_COLOR[status])}>
+              {STATUS_LABEL[status]}
+            </span>
+          </div>
+
+          {/* Guidance: waiting for SPA form */}
+          {status === 'open' && (
+            <div className="mt-2 ml-6 p-3 bg-blue-50 border border-blue-100 rounded-lg">
+              <p className="text-xs text-blue-700 leading-relaxed">
+                Waiting for the application form. If you see an <strong>Apply</strong> or <strong>Sign In</strong> button
+                in the browser window, complete that step and we'll detect the form automatically.
+              </p>
+            </div>
+          )}
+
+          {/* Dropdown hint: form detected */}
+          {status === 'form_detected' && (
+            <div className="mt-2 ml-6 p-3 bg-amber-50 border border-amber-100 rounded-lg">
+              <p className="text-xs text-amber-700 leading-relaxed">
+                This form may contain <strong>Yes/No dropdowns</strong> (sponsorship, work authorization, referral, etc.).
+                Autofill will select the most confident answer based on your profile. Anything unclear will be skipped and shown below.
+              </p>
+            </div>
+          )}
+
+          {/* Error detail */}
+          {(isError && (error || session?.error_msg)) && (
+            <p className="text-xs text-red-500 mt-1 ml-6.5 leading-relaxed">
+              {error || session?.error_msg}
+            </p>
+          )}
+
+          {/* Detected fields */}
+          {session?.detected_fields_json && (
+            <div className="mt-3">
+              <p className="text-xs font-medium text-gray-600 mb-1.5">
+                Detected fields ({JSON.parse(session.detected_fields_json as string).length}):
+              </p>
+              <div className="flex flex-wrap gap-1">
+                {(JSON.parse(session.detected_fields_json as string) as string[]).map((f) => (
+                  <span key={f} className="px-2 py-0.5 text-xs bg-gray-100 text-gray-600 rounded-full">
+                    {f}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Fill results */}
+        {fillResult && (
+          <div className="px-6 pb-4 space-y-3">
+            {fillResult.filled.length > 0 && (
+              <div>
+                <p className="text-xs font-semibold text-emerald-700 mb-1">
+                  Filled ({fillResult.filled.length})
+                </p>
+                <ul className="space-y-0.5">
+                  {fillResult.filled.map((f) => (
+                    <li key={f} className="flex items-center gap-1.5 text-xs text-gray-700">
+                      <svg className="w-3 h-3 text-emerald-500 shrink-0" fill="none" viewBox="0 0 24 24" strokeWidth={2.5} stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
+                      </svg>
+                      {f}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {fillResult.skipped.length > 0 && (
+              <div>
+                <p className="text-xs font-semibold text-gray-500 mb-1">
+                  Needs manual input ({fillResult.skipped.length})
+                </p>
+                <ul className="space-y-0.5">
+                  {fillResult.skipped.map((f) => (
+                    <li key={f} className="flex items-center gap-1.5 text-xs text-gray-400">
+                      <svg className="w-3 h-3 text-gray-300 shrink-0" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M18 12H6" />
+                      </svg>
+                      {f}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Actions */}
+        <div className="flex items-center justify-between px-6 py-4 border-t border-gray-100 bg-gray-50/60">
+          <p className="text-xs text-gray-400">
+            Forms are never submitted automatically.
+          </p>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={onClose}
+              className="px-3 py-1.5 text-xs font-medium text-gray-600 bg-white border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors"
+            >
+              Close
+            </button>
+            <button
+              onClick={handleAutofill}
+              disabled={!canAutofill}
+              className={clsx(
+                'flex items-center gap-1.5 px-4 py-1.5 text-xs font-semibold rounded-lg transition-colors',
+                canAutofill
+                  ? 'bg-indigo-600 text-white hover:bg-indigo-700'
+                  : 'bg-gray-100 text-gray-400 cursor-not-allowed',
+              )}
+            >
+              {filling ? (
+                <>
+                  <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                  </svg>
+                  Filling…
+                </>
+              ) : (
+                <>
+                  <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" strokeWidth={2.5} stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09z" />
+                  </svg>
+                  Autofill
+                </>
+              )}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,15 @@
+{
+  "name": "job-application-automation",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently --names \"server,client,runner\" --prefix-colors \"blue,green,yellow\" \"pnpm --filter server dev\" \"pnpm --filter client dev\" \"pnpm --filter runner dev\"",
+    "build": "pnpm --filter server build && pnpm --filter client build",
+    "install:all": "pnpm install"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild", "playwright"]
+  }
+}
