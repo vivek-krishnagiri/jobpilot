@@ -15,6 +15,8 @@
 | Phase 3 | ✅ Complete | Applicant profile + browser autofill via Playwright runner |
 | Phase 3.5 | ✅ Complete | Form watcher (SPA detection) + browser selection (chromium/chrome/msedge/webkit) |
 | Phase 3.7 | ✅ Complete | Expanded profile (25 new fields) + yes/no dropdown autofill + EEO opt-in + cover letter |
+| Phase 4.1 | ✅ Complete | Workday multi-step autofill + ARIA combobox/radio support + field fingerprinting |
+| Phase 5 | ✅ Complete | Multi-user auth (login/signup, per-user profiles, cookie sessions, route protection) |
 | Phase 4 | Planned | Smart matching, scoring, alerts |
 
 ---
@@ -33,7 +35,7 @@ Server (Fastify :3001)
    ▼
 Runner (Playwright :3002)
    │  headful Chromium — opens job URL, detects form, fills fields
-   └─ sessions Map<id, { page, status, detectedFields, fillResult }>
+   └─ sessions Map<id, { page, status, detectedFields, fillResult, lastFillFingerprint, stepCount }>
 ```
 
 ---
@@ -52,35 +54,44 @@ Job Application Automation/
 │   └── src/
 │       ├── types/index.ts    # JobPosting, ApplicantProfile, ApplySession, FillResult
 │       ├── api/
+│       │   ├── client.ts     # Shared apiFetch wrapper (credentials: 'include')
+│       │   ├── auth.ts       # login, signup, logout, getMe
 │       │   ├── jobs.ts       # fetchJobs, markApplied, updateJob
 │       │   ├── sync.ts       # triggerSync, fetchSyncStatus
-│       │   ├── profile.ts    # fetchProfile, saveProfile, uploadResume
+│       │   ├── profile.ts    # fetchProfile, saveProfile, uploadResume, uploadCoverLetter
 │       │   └── apply.ts      # startApplySession, fetchApplySession, triggerAutofill
+│       ├── contexts/
+│       │   └── AuthContext.tsx  # AuthProvider + useAuth hook (user, isLoading, logout)
 │       ├── hooks/
 │       │   ├── useJobs.ts
 │       │   └── useDebounce.ts
 │       ├── utils/date.ts
 │       ├── components/
-│       │   ├── Layout.tsx        # Sidebar nav
+│       │   ├── Layout.tsx        # Sidebar nav + user avatar + logout button
 │       │   ├── FilterPanel.tsx   # Browse filters
 │       │   ├── JobTable.tsx      # Job rows + Apply button → ApplyModal
 │       │   ├── ApplyModal.tsx    # Session status + Autofill button + fill results
 │       │   └── EmptyState.tsx
 │       └── pages/
+│           ├── LoginPage.tsx     # Login / Sign Up tabs, "Get hired soon!!" heading
 │           ├── BrowseJobs.tsx    # Sync Jobs button, toast, filter panel
 │           ├── CurrentJobs.tsx   # Applied jobs + notes
 │           └── Settings.tsx      # My Profile (editable, resume upload) + sources
 │
 ├── server/                   # Fastify + node:sqlite backend
 │   └── src/
-│       ├── index.ts          # Register: cors, multipart, all routes
+│       ├── index.ts          # Register: cors (credentials:true), multipart, global auth hook, all routes
+│       ├── auth/
+│       │   ├── session.ts    # In-memory session store (Map<token,{userId,username,expiresAt}>)
+│       │   └── middleware.ts # FastifyRequest.user augmentation + requireAuth preHandler + populateUser
 │       ├── db/index.ts       # Schema: job_postings, sources, sync_runs,
-│       │                     #         applicant_profile, apply_sessions
+│       │                     #         users, applicant_profile (per-user), apply_sessions
 │       ├── routes/
+│       │   ├── auth.ts       # /api/auth/login, signup, logout, me
 │       │   ├── jobs.ts       # /api/jobs CRUD
 │       │   ├── sync.ts       # /api/sync POST+status
-│       │   ├── profile.ts    # /api/profile GET/PUT/resume
-│       │   └── apply.ts      # /api/apply/session CRUD + autofill
+│       │   ├── profile.ts    # /api/profile GET/PUT/resume (requireAuth, user_id scoped)
+│       │   └── apply.ts      # /api/apply/session CRUD + autofill (requireAuth, user_id scoped)
 │       ├── seed.ts           # Legacy mock seed (NOT called — kept for reference)
 │       └── sync/
 │           ├── types.ts
@@ -96,7 +107,7 @@ Job Application Automation/
     └── src/
         ├── index.ts          # Fastify HTTP server on :3002
         ├── session.ts        # openSession, getSession, fillSession, closeSession
-        └── autofill.ts       # detectFields, fillFields, FIELD_PATTERNS
+        └── autofill.ts       # detectFields, detectCustomFields, fillFields, FIELD_PATTERNS
 ```
 
 ---
@@ -125,20 +136,46 @@ Job Application Automation/
 - CSS attribute selectors use a local `cssAttr()` escape helper (not `CSS.escape` which is browser-only)
 - `autofill.ts` functions accept `Page | Frame` so field detection works on iframes
 
+### Authentication (Phase 5)
+- **Password hashing:** `bcryptjs` (pure-JS, no native compilation) — cost factor 10
+- **Session store:** in-memory `Map<token, {userId, username, expiresAt}>` with 7-day TTL — resets on server restart (acceptable for local-first tool)
+- **Cookie:** `jp_session`, `HttpOnly`, `SameSite=Lax`, `Max-Age=604800` (7 days)
+- **Cookie parsing:** manual from `request.headers.cookie` (no @fastify/cookie needed)
+- **CORS:** `credentials: true` + explicit origin list (`localhost:5173`) — required for cross-origin cookies
+- **TypeScript:** `declare module 'fastify' { interface FastifyRequest { user? } }` in middleware.ts
+- **Global hook:** `fastify.addHook('preHandler', ...)` runs `populateUser()` on every request before route handlers
+- **requireAuth:** Fastify `preHandler` function — returns 401 if `request.user` not set; added to every profile/apply route
+- **Multi-user migration:** `applicant_profile` was a singleton (CHECK id=1); Phase 5 recreates it via rename/copy/drop dance to add `user_id UNIQUE` without the CHECK constraint — all existing data preserved
+- **Default user:** seeded from `DEFAULT_USER_USERNAME` / `DEFAULT_USER_PASSWORD` env vars (defaults: vivek/chess123); existing profile row attached via `UPDATE ... WHERE user_id IS NULL`
+
 ### Frontend
 - React 18 + Vite 5 + Tailwind CSS 3
 - React Router v6, local `useState` (no global store)
-- Native `fetch` proxied via Vite → `:3001`
-- ApplyModal polls `GET /api/apply/session/:id` every 2s while status is transient
+- `AuthContext` + `useAuth` hook wraps the entire app; `RequireAuth` component redirects to `/login` if unauthenticated
+- Shared `apiFetch` wrapper in `api/client.ts` adds `credentials: 'include'` to all requests
+- `LoginPage` shows login/signup tabs; on success sets user in context and navigates to `/browse`
+- `Layout` sidebar footer shows username initial + logout button; logout calls `/api/auth/logout` and redirects to `/login`
+- `ApplyModal` polls `GET /api/apply/session/:id` every 2s while status is transient
 
 ---
 
 ## Data Model
 
-### `applicant_profile` (singleton: id = 1)
+### `users` (Phase 5)
 | Column | Type | Notes |
 |--------|------|-------|
-| `id` | INTEGER PK | Always 1 — singleton row |
+| `id` | INTEGER PK | |
+| `username` | TEXT UNIQUE COLLATE NOCASE | Case-insensitive unique |
+| `password_hash` | TEXT | bcrypt hash (cost 10) — never stored in plaintext |
+| `created_at` | TEXT | ISO timestamp |
+
+Default user seeded on startup from env vars `DEFAULT_USER_USERNAME` / `DEFAULT_USER_PASSWORD` (defaults: `vivek` / `chess123`).
+
+### `applicant_profile` (per-user, Phase 5)
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | INTEGER PK | Auto-increment (no longer constrained to 1) |
+| `user_id` | INTEGER UNIQUE | FK → users.id; one profile per user |
 | `first_name` | TEXT | |
 | `last_name` | TEXT | |
 | `preferred_name` | TEXT | |
@@ -184,6 +221,7 @@ Job Application Automation/
 | `job_url` | TEXT | URL passed to runner |
 | `status` | TEXT | `created→opening→open→form_detected→filling→filled` or `error/closed` |
 | `browser` | TEXT | Browser used (`chromium` / `chrome` / `msedge` / `webkit`) |
+| `user_id` | INTEGER | FK → users.id (Phase 5) |
 | `detected_fields_json` | TEXT nullable | JSON array of field labels found by runner |
 | `fill_result_json` | TEXT nullable | `{ filled[], skipped[], total }` |
 | `error_msg` | TEXT nullable | Error message if status=error |
@@ -195,6 +233,16 @@ Job Application Automation/
 ---
 
 ## API Endpoints
+
+### Auth (Phase 5)
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/auth/login` | Body: `{username, password}`. Sets `jp_session` cookie. Returns `{user}` |
+| POST | `/api/auth/signup` | Body: `{username, password}`. Creates user + blank profile. Sets cookie. Returns `{user}` |
+| POST | `/api/auth/logout` | Clears `jp_session` cookie |
+| GET | `/api/auth/me` | Returns `{user: {userId, username}}` or 401 |
+
+All other `/api/*` routes (except `/api/jobs` and `/api/sync`) require the `jp_session` cookie. Missing/expired cookie → 401.
 
 ### Profile
 | Method | Path | Description |
@@ -263,7 +311,49 @@ EEO fields are skipped unless `profile.allow_eeo_autofill === '1'`. Reason shown
 ### Cover letter vs resume file detection
 File inputs labeled with "cover letter" or attrs containing "cover"/"coverletter" → `cover_letter_file_path`. All others → `resume_file_path`.
 
-Skipped automatically: checkboxes, radios, unmapped fields, fields with no profile value, EEO fields when opt-in is off.
+### Phase 4.1 — ARIA widget support
+
+`detectCustomFields(page: Page | Frame)` — new export:
+- Injects `data-jp-cb="N"` on `[role="combobox"]` elements, `data-jp-rg="N"` on `fieldset`/`[role="radiogroup"]` with ≥2 radios
+- Returns `DetectedField[]` with `widgetType: 'combobox' | 'radio_group'`
+- Results merged into `detectFieldsAllFrames()` alongside native fields
+
+`fillCombobox(page, selector, desiredText, isBoolean)`:
+- Click trigger → `locator('[role="listbox"]').waitFor({ state: 'visible' })` → score `[role="option"]` in browser context → click best option
+
+`fillRadioGroup(page, selector, desiredText, isBoolean)`:
+- Find radio inputs in container → score labels → click best via `label[for="id"]` or direct radio click
+
+`fillFields()` routing (updated, step 5 added before file check):
+1. `!key` → skip
+2. EEO guard
+3. Resolve value
+4. No value → skip
+5. `widgetType === 'combobox'` → `fillCombobox()`
+6. `widgetType === 'radio_group'` → `fillRadioGroup()`
+7. `type === 'file'` → `setInputFiles()`
+8. `type === 'checkbox'|'radio'` (native) → skip
+9. `type === 'select'` AND `BOOLEAN_KEYS` → `fillSelectYesNo()`
+10. `type === 'select'` → `fillSelectSmart()`
+11. Default → `locator.fill()`
+
+### Multi-step tracking (`runner/src/session.ts`)
+
+`SessionState` gains:
+- `lastFillFingerprint: string` — sorted `selector:type:profileKey` signature of last filled field set
+- `stepCount: number` — increments on each successful fill
+
+`computeFingerprint(fields)` — stable sorted join of field signatures.
+
+After each `fillSession()` call: `lastFillFingerprint = computeFingerprint(fields)`, `stepCount++`.
+
+### Client polling (Phase 4.1)
+
+`POLLING_STATUSES` in `ApplyModal.tsx` now includes `'form_detected'` and `'filled'`, so the modal continues polling after each autofill step to detect when the next Workday step becomes available.
+
+Fill history is accumulated in `fillHistory: FillResult[]` state. Each step's results are shown under "Step N results" labels.
+
+Skipped automatically: native checkboxes/radios, unmapped fields, fields with no profile value, EEO fields when opt-in is off.
 
 **NEVER clicks Submit.** Injects a visible overlay badge when autofill completes.
 
@@ -306,14 +396,14 @@ pnpm --filter runner dev
 
 ### Form Watcher (`runner/src/session.ts` — `watchForForm()`)
 
-After initial page load, if a form is not immediately detected, a background watcher starts:
+The watcher always starts (regardless of initial form detection) and runs for the session lifetime:
 
 1. **MutationObserver injection** — `window.__jp_dom_changed` flag is set by an observer watching `document.documentElement`; reset after each read
 2. **Navigation events** — `page.on('framenavigated')` and `page.on('domcontentloaded')` set a `navOccurred` flag
 3. **1-second polling loop** — checks URL change, `__jp_dom_changed` flag, and `navOccurred`; if any changed, re-runs field detection
-4. **Iframe support** — `detectFieldsAllFrames()` iterates `page.frames()` (1 level deep), calls `detectFields()` on each, and merges results deduped by selector
+4. **Iframe support** — `detectFieldsAllFrames()` iterates `page.frames()` (1 level deep), calls `detectFields()` and `detectCustomFields()` on each, merges results deduped by selector
 5. **Throttle guard** — `checkInProgress` boolean prevents concurrent checks within the same interval tick
-6. **Auto-stop** — interval clears when status reaches `form_detected | filled | error | closed`
+6. **State machine** — watcher skips when `filling` or `form_detected`; only stops when `error | closed`
 
 Detection threshold: **≥ 2 non-file fields** → `form_detected`.
 
@@ -328,17 +418,24 @@ Detection threshold: **≥ 2 non-file fields** → `form_detected`.
 | `msedge` | `chromium.launch({ channel: 'msedge', headless: false })` |
 | `webkit` | `webkit.launch({ headless: false })` |
 
-### SPA Detection Flow
+### SPA Detection Flow (Phase 4.1)
 
 ```
-openSession() → page.goto() → initial detectFields()
+openSession() → page.goto() → initial detectFieldsAllFrames()
     ↓ form found?
     YES → status=form_detected, banner injected
-    NO  → status=open, watchForForm() starts (background)
-              ↓ every 1s
-              DOM changed / URL changed / nav occurred?
-              YES → detectFieldsAllFrames()
-                    ≥2 fields? → status=form_detected, watcher stops
+    NO  → status=open
+
+    Always: watchForForm() starts (background)
+
+    Watcher state machine (every 1s):
+      status=filling|form_detected → skip
+      status=open  → DOM/URL changed? → detectFieldsAllFrames() → ≥2 fields? → form_detected
+      status=filled → DOM/URL changed?
+                      → detectFieldsAllFrames()
+                      → fingerprint ≠ lastFillFingerprint AND ≥2 fields?
+                      → form_detected (new Workday step!)
+      status=error|closed → stop
 ```
 
 ### DB Column Migrations
@@ -384,3 +481,5 @@ openSession() → page.goto() → initial detectFields()
 | 2026-03-04 | Phase 3: Applicant profile + browser autofill — runner package (Playwright), /api/profile, /api/apply/session, My Profile UI in Settings, Apply button + modal in JobTable |
 | 2026-03-04 | Phase 3.5: Form watcher (MutationObserver + SPA nav detection + iframe merge) + browser selection (chromium/chrome/msedge/webkit) + preferred_browser profile field |
 | 2026-03-04 | Phase 3.7: 25 new profile columns (address/work-auth/referral/EEO/cover-letter) + BOOLEAN_PATTERNS + EEO_PATTERNS + fillSelectSmart/fillSelectYesNo + virtual exp/edu keys + Settings accordion UI + ApplyModal dropdown hint |
+| 2026-03-04 | Phase 4.1: detectCustomFields (combobox + radio_group ARIA widgets) + fillCombobox + fillRadioGroup + field fingerprinting + multi-step watcher (never stops at filled) + stepCount + fillHistory in modal + POLLING_STATUSES expanded |
+| 2026-03-05 | Phase 5: Multi-user auth — users table, bcryptjs password hashing, in-memory session store, jp_session cookie, requireAuth preHandler, per-user profile + apply_sessions, login/signup/logout/me endpoints, LoginPage, AuthContext, RequireAuth, apiFetch wrapper, Layout user menu |

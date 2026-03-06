@@ -1,5 +1,6 @@
-import { NavLink, Outlet } from 'react-router-dom';
+import { NavLink, Outlet, useNavigate } from 'react-router-dom';
 import clsx from 'clsx';
+import { useAuth } from '../contexts/AuthContext';
 
 const navItems = [
   {
@@ -33,6 +34,14 @@ const navItems = [
 ];
 
 export default function Layout() {
+  const { user, logout } = useAuth();
+  const navigate = useNavigate();
+
+  const handleLogout = async () => {
+    await logout();
+    navigate('/login', { replace: true });
+  };
+
   return (
     <div className="flex h-screen overflow-hidden bg-gray-50">
       {/* Sidebar */}
@@ -72,9 +81,29 @@ export default function Layout() {
           ))}
         </nav>
 
-        {/* Footer */}
+        {/* User footer */}
         <div className="px-4 py-3 border-t border-gray-100">
-          <span className="text-xs text-gray-400">Phase 3 · Apply Assist</span>
+          {user && (
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2 min-w-0">
+                <div className="w-6 h-6 rounded-full bg-indigo-100 flex items-center justify-center shrink-0">
+                  <span className="text-xs font-bold text-indigo-600">
+                    {user.username.charAt(0).toUpperCase()}
+                  </span>
+                </div>
+                <span className="text-xs font-medium text-gray-700 truncate">{user.username}</span>
+              </div>
+              <button
+                onClick={handleLogout}
+                title="Log out"
+                className="text-gray-400 hover:text-gray-600 transition-colors shrink-0 ml-1"
+              >
+                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 9V5.25A2.25 2.25 0 0013.5 3h-6a2.25 2.25 0 00-2.25 2.25v13.5A2.25 2.25 0 007.5 21h6a2.25 2.25 0 002.25-2.25V15m3 0l3-3m0 0l-3-3m3 3H9" />
+                </svg>
+              </button>
+            </div>
+          )}
         </div>
       </aside>
 

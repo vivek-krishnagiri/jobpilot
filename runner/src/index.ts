@@ -43,6 +43,7 @@ async function start() {
       fillResult: state.fillResult,
       errorMsg: state.errorMsg,
       lastUpdated: state.lastUpdated,
+      stepCount: state.stepCount,
     });
   });
 

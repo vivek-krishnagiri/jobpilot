@@ -1,6 +1,6 @@
 import type { Browser, Page } from 'playwright';
 import { chromium, webkit } from 'playwright';
-import { detectFields, fillFields } from './autofill';
+import { detectFields, detectCustomFields, fillFields } from './autofill';
 import type { DetectedField, FillResult, Profile } from './autofill';
 
 // ─── Session state ─────────────────────────────────────────────────────────────
@@ -24,6 +24,9 @@ export interface SessionState {
   errorMsg: string | null;
   lastUpdated: string;
   page: Page | null;
+  // Phase 4.1: multi-step tracking
+  lastFillFingerprint: string;
+  stepCount: number;
 }
 
 // ─── In-memory session store ──────────────────────────────────────────────────
@@ -56,16 +59,40 @@ async function getBrowser(browserType: string): Promise<Browser> {
   return b;
 }
 
+// ─── Fingerprint: stable hash of detected field set ──────────────────────────
+//
+// Used to detect when a Workday wizard step has changed — if the fingerprint
+// differs from lastFillFingerprint after the user clicks "Next", we know a
+// new step with new fields has loaded and we should re-enable Autofill.
+
+function computeFingerprint(fields: DetectedField[]): string {
+  return fields
+    .map((f) => `${f.selector}:${f.type}:${f.profileKey ?? ''}`)
+    .sort()
+    .join('|');
+}
+
 // ─── Detect fields across main frame + 1-level-deep child frames ──────────────
 
 async function detectFieldsAllFrames(page: Page): Promise<DetectedField[]> {
   const allFields: DetectedField[] = [];
   const seenSelectors = new Set<string>();
 
-  // Main frame
+  // Main frame — native inputs
   try {
     const mainFields = await detectFields(page);
     for (const f of mainFields) {
+      if (f.selector && !seenSelectors.has(f.selector)) {
+        seenSelectors.add(f.selector);
+        allFields.push(f);
+      }
+    }
+  } catch { /* ignore */ }
+
+  // Main frame — custom ARIA widgets (comboboxes, radio groups)
+  try {
+    const customFields = await detectCustomFields(page);
+    for (const f of customFields) {
       if (f.selector && !seenSelectors.has(f.selector)) {
         seenSelectors.add(f.selector);
         allFields.push(f);
@@ -85,6 +112,16 @@ async function detectFieldsAllFrames(page: Page): Promise<DetectedField[]> {
         }
       }
     } catch { /* ignore — iframe may be cross-origin */ }
+
+    try {
+      const frameCustomFields = await detectCustomFields(frame);
+      for (const f of frameCustomFields) {
+        if (f.selector && !seenSelectors.has(f.selector)) {
+          seenSelectors.add(f.selector);
+          allFields.push(f);
+        }
+      }
+    } catch { /* ignore */ }
   }
 
   return allFields;
@@ -92,8 +129,12 @@ async function detectFieldsAllFrames(page: Page): Promise<DetectedField[]> {
 
 // ─── Show "form detected" banner in page ─────────────────────────────────────
 
-async function showFormDetectedBanner(page: Page, count: number): Promise<void> {
-  await page.evaluate((n) => {
+async function showFormDetectedBanner(page: Page, count: number, step?: number): Promise<void> {
+  const label = step && step > 1
+    ? `JobPilot: step ${step} detected (${count} fields) — click Autofill in dashboard`
+    : `JobPilot: form detected (${count} fields) — click Autofill in dashboard`;
+
+  await page.evaluate((text) => {
     const existing = document.getElementById('__jobpilot_banner__');
     if (existing) existing.remove();
     const div = document.createElement('div');
@@ -104,12 +145,20 @@ async function showFormDetectedBanner(page: Page, count: number): Promise<void> 
       'font-family:system-ui,sans-serif', 'font-size:13px', 'font-weight:600',
       'padding:8px 14px', 'border-radius:8px', 'box-shadow:0 4px 12px rgba(0,0,0,.15)',
     ].join(';');
-    div.textContent = `JobPilot: form detected (${n} fields) — click Autofill in dashboard`;
+    div.textContent = text;
     document.body.appendChild(div);
-  }, count).catch(() => { /* ignore */ });
+  }, label).catch(() => { /* ignore */ });
 }
 
 // ─── Watcher: continuously watch for application form ────────────────────────
+//
+// Phase 4.1 changes from Phase 3.5:
+//   - TERMINAL is now only ['error', 'closed'] — watcher never stops at form_detected or filled
+//   - State machine:
+//       'filling'       → skip (fill in progress)
+//       'form_detected' → skip (waiting for user to click Autofill)
+//       'open'          → scan → if ≥2 fields → form_detected
+//       'filled'        → scan → if fingerprint ≠ lastFillFingerprint → form_detected (new step)
 
 async function watchForForm(sessionId: number): Promise<void> {
   const state = sessions.get(sessionId);
@@ -120,7 +169,8 @@ async function watchForForm(sessionId: number): Promise<void> {
   let navOccurred = false;
   let checkInProgress = false;
 
-  const TERMINAL: Set<SessionStatus> = new Set(['form_detected', 'filled', 'error', 'closed']);
+  // Only truly terminal states stop the watcher
+  const TERMINAL: Set<SessionStatus> = new Set(['error', 'closed']);
 
   // Inject MutationObserver into the page
   try {
@@ -138,11 +188,14 @@ async function watchForForm(sessionId: number): Promise<void> {
   page.on('domcontentloaded', () => { navOccurred = true; });
 
   const interval = setInterval(async () => {
-    // Stop if reached terminal state
+    // Stop only when truly terminal
     if (TERMINAL.has(state.status)) {
       clearInterval(interval);
       return;
     }
+
+    // Skip while filling or already waiting for autofill
+    if (state.status === 'filling' || state.status === 'form_detected') return;
 
     // Throttle: skip if check already running
     if (checkInProgress) return;
@@ -168,7 +221,7 @@ async function watchForForm(sessionId: number): Promise<void> {
         navOccurred = false;
 
         // Re-inject observer after navigation
-        if (urlChanged || navOccurred) {
+        if (urlChanged) {
           try {
             await page.evaluate(() => {
               (window as unknown as { __jp_dom_changed: boolean }).__jp_dom_changed = false;
@@ -184,19 +237,31 @@ async function watchForForm(sessionId: number): Promise<void> {
         const hasForm = fields.length >= 2 && fields.some((f) => f.type !== 'file');
 
         if (hasForm) {
-          state.detectedFields = fields;
-          state.status = 'form_detected';
-          state.lastUpdated = new Date().toISOString();
-          clearInterval(interval);
+          const fingerprint = computeFingerprint(fields);
 
-          console.log(`[runner] session=${sessionId} form_detected fields=${fields.length} url=${currentUrl}`);
-          await showFormDetectedBanner(page, fields.length);
+          if (state.status === 'open') {
+            // First form detection
+            state.detectedFields = fields;
+            state.status = 'form_detected';
+            state.lastUpdated = new Date().toISOString();
+            console.log(`[runner] session=${sessionId} form_detected fields=${fields.length} url=${currentUrl}`);
+            await showFormDetectedBanner(page, fields.length);
+
+          } else if (state.status === 'filled' && fingerprint !== state.lastFillFingerprint) {
+            // New Workday wizard step: different fields appeared after user clicked "Next"
+            state.detectedFields = fields;
+            state.status = 'form_detected';
+            state.lastUpdated = new Date().toISOString();
+            const step = state.stepCount + 1;
+            console.log(`[runner] session=${sessionId} new_step=${step} fields=${fields.length} url=${currentUrl}`);
+            await showFormDetectedBanner(page, fields.length, step);
+          }
         }
       }
 
       state.lastUpdated = new Date().toISOString();
-    } catch (err) {
-      // Page closed or navigated — ignore, watcher will stop on next tick
+    } catch {
+      // Page closed or navigated — check if terminal and clean up
       if (TERMINAL.has(state.status)) clearInterval(interval);
     } finally {
       checkInProgress = false;
@@ -217,6 +282,8 @@ export async function openSession(sessionId: number, url: string, browserType = 
     errorMsg: null,
     lastUpdated: new Date().toISOString(),
     page: null,
+    lastFillFingerprint: '',
+    stepCount: 0,
   };
   sessions.set(sessionId, state);
 
@@ -242,9 +309,12 @@ export async function openSession(sessionId: number, url: string, browserType = 
       await showFormDetectedBanner(page, initialFields.length);
     } else {
       console.log(`[runner] session=${sessionId} status=open fields=${initialFields.length} url=${url} — watching…`);
-      // Start continuous watcher for SPA / multi-step forms
-      watchForForm(sessionId).catch(() => { /* background — ignore errors */ });
     }
+
+    // Always start the watcher — it handles multi-step forms and SPA navigation.
+    // The watcher skips when status is 'form_detected' or 'filling', so it's safe
+    // to start even when the form was already detected above.
+    watchForForm(sessionId).catch(() => { /* background — ignore errors */ });
 
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -281,11 +351,16 @@ export async function fillSession(sessionId: number, profile: Profile): Promise<
 
     const result = await fillFields(state.page, fields, profile);
     state.fillResult = result;
+
+    // Save fingerprint so the watcher can detect when a new step loads
+    state.lastFillFingerprint = computeFingerprint(fields);
+    state.stepCount++;
+
     state.status = 'filled';
     state.lastUpdated = new Date().toISOString();
 
     console.log(
-      `[runner] session=${sessionId} filled=${result.filled.length} skipped=${result.skipped.length}`,
+      `[runner] session=${sessionId} step=${state.stepCount} filled=${result.filled.length} skipped=${result.skipped.length}`,
     );
 
     return result;

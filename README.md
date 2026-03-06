@@ -43,11 +43,46 @@ pnpm dev
 
 The database and resume upload folder are created automatically in `server/data/` on first run.
 
+**5. Log in** — open `http://localhost:5173`. You'll be redirected to the login page. Default credentials:
+
+| Field | Value |
+|-------|-------|
+| Username | `vivek` |
+| Password | `chess123` |
+
+You can also create a new account via the **Sign up** tab.
+
+---
+
+## Authentication
+
+JobPilot uses **cookie-based sessions** with bcrypt-hashed passwords. Sessions are stored in memory on the server — a server restart logs everyone out (normal for a local-first tool).
+
+- Accounts are created via the **Sign up** tab on the login page
+- Each account has its own private profile, resume, and apply session history
+- Profiles and sessions are completely isolated between users
+
+### Changing the default credentials
+
+Set environment variables before starting the server (or create `server/.env`):
+
+```bash
+DEFAULT_USER_USERNAME=yourname
+DEFAULT_USER_PASSWORD=your-secure-password
+```
+
+These are only used when the default user doesn't already exist in the database. Passwords are hashed with bcrypt (cost 10) and never stored in plaintext.
+
 ---
 
 ## Environment Variables
 
-JobPilot requires **no API keys or secrets** by default. All data is stored locally. A `.env.example` is provided for reference — no action needed to get started.
+JobPilot requires **no API keys or secrets** by default. All data is stored locally. See `.env.example` for all available variables.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DEFAULT_USER_USERNAME` | `vivek` | Username for the default account created on first run |
+| `DEFAULT_USER_PASSWORD` | `chess123` | Password for the default account (bcrypt-hashed before storage) |
 
 ---
 
@@ -110,16 +145,18 @@ Click **Upload** next to the Cover Letter row. When a form has a cover letter fi
 
 ## What Autofill Fills
 
-Autofill matches form fields by label text, `aria-label`, and `name`/`id`/`autocomplete` attributes.
+Autofill matches form fields by label text, `aria-label`, and `name`/`id`/`autocomplete` attributes. It handles both native HTML controls and Workday-style ARIA widgets.
 
 | Field type | Strategy |
 |-----------|---------|
 | Text / email / tel / textarea | `fill()` with profile value |
 | `<select>` — yes/no fields | Smart yes/no option matching (e.g. "No", "N", "false" all match "No") |
 | `<select>` — general dropdowns | Fuzzy text match (exact → starts-with → contains) |
+| `[role="combobox"]` (Workday) | Click trigger → wait for listbox → score `[role="option"]` elements → click best |
+| `[role="radiogroup"]` / `fieldset` | Score radio labels → click best matching radio |
 | File upload (resume) | `setInputFiles()` with saved resume path |
 | File upload (cover letter) | `setInputFiles()` with saved cover letter path |
-| Checkbox / radio | **Skipped** — needs manual input |
+| Native checkbox / radio | **Skipped** — needs manual input |
 | EEO fields | **Skipped unless** you enable EEO autofill in Settings |
 
 Fields that cannot be filled are listed in the **"Needs manual input"** section of the modal with the reason.
@@ -134,7 +171,9 @@ After clicking Apply, JobPilot watches for the form using three mechanisms:
 - **DOM MutationObserver** — a `MutationObserver` is injected into the page; signals the runner when DOM changes
 - **1-second polling fallback** — catch-all loop
 
-The runner also checks **iframes** (1 level deep) for embedded form fields. Once ≥ 2 non-file fields are found, the status transitions to `form_detected` and the Autofill button enables. The watcher stops automatically.
+The runner also checks **iframes** (1 level deep) for embedded form fields, and detects ARIA widgets (`[role="combobox"]`, `[role="radiogroup"]`). Once ≥ 2 non-file fields are found, the status transitions to `form_detected` and the Autofill button enables.
+
+**Multi-step forms (Workday wizard):** The watcher never stops after the first fill. After you click Autofill and then click **Next** in the browser, the runner detects the new step's fields by comparing a fingerprint of the current field set against what was last filled. When the fields differ, the status transitions back to `form_detected` and the Autofill button re-enables for the next step. The modal shows "Step 2 results", "Step 3 results", etc.
 
 ---
 
@@ -276,6 +315,12 @@ Workday, Greenhouse, and Lever load their forms dynamically. After the browser o
 2. Sign in or create an account if prompted
 3. Navigate to the form page — the runner will detect it automatically
 
+**401 Unauthorized / redirected to login unexpectedly**
+The server session store is in-memory — a server restart clears all sessions. Just log in again. This is normal for local use.
+
+**"Username already taken" on signup**
+Username comparison is case-insensitive. Try a different name.
+
 **Node version**
 JobPilot uses `node:sqlite` (built-in `DatabaseSync` API) which requires **Node.js 23+**.
 
@@ -290,6 +335,8 @@ JobPilot uses `node:sqlite` (built-in `DatabaseSync` API) which requires **Node.
 | Phase 3 | Complete | Applicant profile + browser autofill via Playwright |
 | Phase 3.5 | Complete | Form watcher (SPA detection) + browser selection |
 | Phase 3.7 | Complete | Expanded profile + yes/no dropdown autofill + EEO opt-in + cover letter |
+| Phase 4.1 | Complete | Workday multi-step autofill + ARIA combobox + radio group support |
+| Phase 5 | Complete | Multi-user authentication — login/signup, per-user profiles, cookie sessions |
 | Phase 4 | Planned | Smart matching, scoring, email alerts |
 
 ---

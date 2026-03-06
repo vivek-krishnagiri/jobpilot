@@ -1,4 +1,4 @@
-const API = '/api';
+import { API, apiFetch } from './client';
 
 export interface SourceResult {
   source: string;
@@ -34,7 +34,7 @@ export interface SyncStatus {
 }
 
 export async function triggerSync(): Promise<SyncResult> {
-  const res = await fetch(`${API}/sync`, { method: 'POST' });
+  const res = await apiFetch(`${API}/sync`, { method: 'POST' });
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: res.statusText })) as { error?: string };
     throw new Error(body.error ?? `Sync failed: ${res.statusText}`);
@@ -43,7 +43,7 @@ export async function triggerSync(): Promise<SyncResult> {
 }
 
 export async function fetchSyncStatus(): Promise<SyncStatus> {
-  const res = await fetch(`${API}/sync/status`);
+  const res = await apiFetch(`${API}/sync/status`);
   if (!res.ok) throw new Error(`Failed to fetch sync status: ${res.statusText}`);
   return res.json() as Promise<SyncStatus>;
 }

@@ -1,5 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import db from '../db/index';
+import { requireAuth } from '../auth/middleware';
 
 const RUNNER_URL = 'http://localhost:3002';
 
@@ -51,8 +52,9 @@ function updateSession(id: number, fields: Partial<Record<string, unknown>>) {
 export async function applyRoutes(fastify: FastifyInstance) {
 
   // POST /api/apply/session  — start a new apply session
-  fastify.post<{ Body: { jobId: number } }>('/apply/session', async (request, reply) => {
+  fastify.post<{ Body: { jobId: number } }>('/apply/session', { preHandler: requireAuth }, async (request, reply) => {
     const { jobId } = request.body;
+    const userId = request.user!.userId;
     if (!jobId) return reply.status(400).send({ error: 'jobId is required.' });
 
     const job = db.prepare('SELECT id, url FROM job_postings WHERE id = ?').get(jobId) as unknown as JobRow | undefined;
@@ -60,16 +62,16 @@ export async function applyRoutes(fastify: FastifyInstance) {
 
     // Read preferred browser from profile (default chromium)
     const profileRow = db
-      .prepare('SELECT preferred_browser FROM applicant_profile WHERE id = 1')
-      .get() as { preferred_browser?: string } | undefined;
+      .prepare('SELECT preferred_browser FROM applicant_profile WHERE user_id = ?')
+      .get(userId) as { preferred_browser?: string } | undefined;
     const browser = profileRow?.preferred_browser ?? 'chromium';
 
     // Insert session record
     const now = new Date().toISOString();
     const result = db.prepare(`
-      INSERT INTO apply_sessions (job_id, job_url, status, browser, created_at, updated_at)
-      VALUES (?, ?, 'created', ?, ?, ?)
-    `).run(job.id, job.url, browser, now, now);
+      INSERT INTO apply_sessions (job_id, job_url, status, browser, user_id, created_at, updated_at)
+      VALUES (?, ?, 'created', ?, ?, ?, ?)
+    `).run(job.id, job.url, browser, userId, now, now);
 
     const sessionId = Number(result.lastInsertRowid);
 
@@ -100,15 +102,18 @@ export async function applyRoutes(fastify: FastifyInstance) {
   });
 
   // GET /api/apply/session/:id  — poll session status
-  fastify.get<{ Params: { id: string } }>('/apply/session/:id', async (request, reply) => {
+  fastify.get<{ Params: { id: string } }>('/apply/session/:id', { preHandler: requireAuth }, async (request, reply) => {
+    const userId = request.user!.userId;
     const session = db
-      .prepare('SELECT * FROM apply_sessions WHERE id = ?')
-      .get(request.params.id) as unknown as ApplySessionRow | undefined;
+      .prepare('SELECT * FROM apply_sessions WHERE id = ? AND user_id = ?')
+      .get(request.params.id, userId) as unknown as ApplySessionRow | undefined;
 
     if (!session) return reply.status(404).send({ error: 'Session not found.' });
 
-    // While the browser is open and watching, proxy runner for fresh status
-    if (session.status === 'opening' || session.status === 'open') {
+    // Proxy the runner for fresh status while the session is still active.
+    // This covers the multi-step case: after fill (status='filled'), the runner
+    // may transition back to 'form_detected' when a new Workday step loads.
+    if (!['error', 'closed'].includes(session.status)) {
       try {
         const res = await runnerFetch(`/sessions/${session.id}`);
         if (res.ok) {
@@ -127,16 +132,17 @@ export async function applyRoutes(fastify: FastifyInstance) {
   });
 
   // POST /api/apply/session/:id/autofill  — trigger form fill
-  fastify.post<{ Params: { id: string } }>('/apply/session/:id/autofill', async (request, reply) => {
+  fastify.post<{ Params: { id: string } }>('/apply/session/:id/autofill', { preHandler: requireAuth }, async (request, reply) => {
+    const userId = request.user!.userId;
     const session = db
-      .prepare('SELECT * FROM apply_sessions WHERE id = ?')
-      .get(request.params.id) as unknown as ApplySessionRow | undefined;
+      .prepare('SELECT * FROM apply_sessions WHERE id = ? AND user_id = ?')
+      .get(request.params.id, userId) as unknown as ApplySessionRow | undefined;
 
     if (!session) return reply.status(404).send({ error: 'Session not found.' });
     if (session.status === 'error') return reply.status(409).send({ error: `Session in error state: ${session.error_msg}` });
 
     // Load profile
-    const profile = db.prepare('SELECT * FROM applicant_profile WHERE id = 1').get() as unknown as Record<string, unknown> | undefined;
+    const profile = db.prepare('SELECT * FROM applicant_profile WHERE user_id = ?').get(userId) as unknown as Record<string, unknown> | undefined;
     if (!profile) return reply.status(400).send({ error: 'No profile saved. Please create your profile first.' });
 
     updateSession(session.id, { status: 'filling' });

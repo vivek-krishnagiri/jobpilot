@@ -2,11 +2,13 @@ import type { FastifyInstance } from 'fastify';
 import path from 'path';
 import fs from 'fs';
 import db from '../db/index';
+import { requireAuth } from '../auth/middleware';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export interface ProfileRow {
   id: number;
+  user_id: number;
   first_name: string;
   last_name: string;
   preferred_name: string;
@@ -168,18 +170,21 @@ function extractFieldsFromText(text: string): ExtractedFields {
   return fields;
 }
 
-// ─── Ensure singleton profile row exists ──────────────────────────────────────
+// ─── Ensure per-user profile row exists ───────────────────────────────────────
 
-function ensureProfile(): ProfileRow {
+function ensureProfile(userId: number): ProfileRow {
   const existing = db
-    .prepare('SELECT * FROM applicant_profile WHERE id = 1')
-    .get() as unknown as ProfileRow | undefined;
+    .prepare('SELECT * FROM applicant_profile WHERE user_id = ?')
+    .get(userId) as unknown as ProfileRow | undefined;
 
   if (!existing) {
-    db.prepare('INSERT INTO applicant_profile (id, updated_at) VALUES (1, ?)').run(new Date().toISOString());
+    db.prepare('INSERT INTO applicant_profile (user_id, updated_at) VALUES (?, ?)').run(
+      userId,
+      new Date().toISOString(),
+    );
   }
 
-  return db.prepare('SELECT * FROM applicant_profile WHERE id = 1').get() as unknown as ProfileRow;
+  return db.prepare('SELECT * FROM applicant_profile WHERE user_id = ?').get(userId) as unknown as ProfileRow;
 }
 
 // ─── Route plugin ─────────────────────────────────────────────────────────────
@@ -187,13 +192,14 @@ function ensureProfile(): ProfileRow {
 export async function profileRoutes(fastify: FastifyInstance) {
 
   // GET /api/profile
-  fastify.get('/profile', async (_req, reply) => {
-    reply.send(ensureProfile());
+  fastify.get('/profile', { preHandler: requireAuth }, async (request, reply) => {
+    reply.send(ensureProfile(request.user!.userId));
   });
 
   // PUT /api/profile
-  fastify.put<{ Body: ProfileBody }>('/profile', async (request, reply) => {
-    ensureProfile();
+  fastify.put<{ Body: ProfileBody }>('/profile', { preHandler: requireAuth }, async (request, reply) => {
+    const userId = request.user!.userId;
+    ensureProfile(userId);
     const now = new Date().toISOString();
     const allowed = [
       'first_name', 'last_name', 'preferred_name', 'email', 'phone',
@@ -220,14 +226,16 @@ export async function profileRoutes(fastify: FastifyInstance) {
       }
     }
 
+    params.push(userId);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    db.prepare(`UPDATE applicant_profile SET ${setClauses.join(', ')} WHERE id = 1`).run(...(params as any[]));
+    db.prepare(`UPDATE applicant_profile SET ${setClauses.join(', ')} WHERE user_id = ?`).run(...(params as any[]));
 
-    reply.send(db.prepare('SELECT * FROM applicant_profile WHERE id = 1').get() as unknown as ProfileRow);
+    reply.send(db.prepare('SELECT * FROM applicant_profile WHERE user_id = ?').get(userId) as unknown as ProfileRow);
   });
 
   // POST /api/profile/resume  — multipart file upload
-  fastify.post('/profile/resume', async (request, reply) => {
+  fastify.post('/profile/resume', { preHandler: requireAuth }, async (request, reply) => {
+    const userId = request.user!.userId;
     const data = await request.file();
     if (!data) {
       return reply.status(400).send({ error: 'No file uploaded.' });
@@ -259,7 +267,7 @@ export async function profileRoutes(fastify: FastifyInstance) {
     const extracted = resumeText ? extractFieldsFromText(resumeText) : {};
 
     // Persist
-    const profile = ensureProfile();
+    const profile = ensureProfile(userId);
     const now = new Date().toISOString();
     const setClauses = ['resume_file_path = ?', 'resume_text = ?', 'updated_at = ?'];
     const params: unknown[] = [savedPath, resumeText, now];
@@ -269,17 +277,19 @@ export async function profileRoutes(fastify: FastifyInstance) {
       if (val && !existing) { setClauses.push(`${key} = ?`); params.push(val); }
     }
 
+    params.push(userId);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    db.prepare(`UPDATE applicant_profile SET ${setClauses.join(', ')} WHERE id = 1`).run(...(params as any[]));
+    db.prepare(`UPDATE applicant_profile SET ${setClauses.join(', ')} WHERE user_id = ?`).run(...(params as any[]));
 
     reply.send({
-      profile: db.prepare('SELECT * FROM applicant_profile WHERE id = 1').get() as unknown as ProfileRow,
+      profile: db.prepare('SELECT * FROM applicant_profile WHERE user_id = ?').get(userId) as unknown as ProfileRow,
       extracted,
     });
   });
 
   // POST /api/profile/cover-letter  — multipart file upload
-  fastify.post('/profile/cover-letter', async (request, reply) => {
+  fastify.post('/profile/cover-letter', { preHandler: requireAuth }, async (request, reply) => {
+    const userId = request.user!.userId;
     const data = await request.file();
     if (!data) {
       return reply.status(400).send({ error: 'No file uploaded.' });
@@ -301,12 +311,12 @@ export async function profileRoutes(fastify: FastifyInstance) {
     fs.writeFileSync(savedPath, buffer);
 
     // Persist path only
-    ensureProfile();
+    ensureProfile(userId);
     const now = new Date().toISOString();
-    db.prepare('UPDATE applicant_profile SET cover_letter_file_path = ?, updated_at = ? WHERE id = 1').run(savedPath, now);
+    db.prepare('UPDATE applicant_profile SET cover_letter_file_path = ?, updated_at = ? WHERE user_id = ?').run(savedPath, now, userId);
 
     reply.send({
-      profile: db.prepare('SELECT * FROM applicant_profile WHERE id = 1').get() as unknown as ProfileRow,
+      profile: db.prepare('SELECT * FROM applicant_profile WHERE user_id = ?').get(userId) as unknown as ProfileRow,
     });
   });
 }

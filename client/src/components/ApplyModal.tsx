@@ -11,7 +11,7 @@ const STATUS_LABEL: Record<SessionStatus, string> = {
   open:          'Browser open — watching for application form…',
   form_detected: 'Form detected — ready to autofill',
   filling:       'Filling form…',
-  filled:        'Form filled',
+  filled:        'Form filled — watching for next step…',
   error:         'Error',
   closed:        'Session closed',
 };
@@ -27,7 +27,9 @@ const STATUS_COLOR: Record<SessionStatus, string> = {
   closed:        'text-gray-400',
 };
 
-const POLLING_STATUSES: SessionStatus[] = ['created', 'opening', 'open'];
+// Poll while in any active (non-terminal) state, including filled so we detect
+// new Workday wizard steps after the user clicks "Next" in the browser.
+const POLLING_STATUSES: SessionStatus[] = ['created', 'opening', 'open', 'form_detected', 'filled'];
 
 // ─── Component ────────────────────────────────────────────────────────────────
 
@@ -39,10 +41,10 @@ interface ApplyModalProps {
 }
 
 export default function ApplyModal({ jobId, jobTitle, company, onClose }: ApplyModalProps) {
-  const [session, setSession]       = useState<ApplySession | null>(null);
-  const [fillResult, setFillResult] = useState<FillResult | null>(null);
-  const [filling, setFilling]       = useState(false);
-  const [error, setError]           = useState<string | null>(null);
+  const [session, setSession]         = useState<ApplySession | null>(null);
+  const [fillHistory, setFillHistory] = useState<FillResult[]>([]);
+  const [filling, setFilling]         = useState(false);
+  const [error, setError]             = useState<string | null>(null);
 
   // Start session immediately on mount
   useEffect(() => {
@@ -51,7 +53,7 @@ export default function ApplyModal({ jobId, jobTitle, company, onClose }: ApplyM
       .catch((err: unknown) => setError(err instanceof Error ? err.message : 'Failed to start session'));
   }, [jobId]);
 
-  // Poll session status while in transient states
+  // Poll session status while in active states
   const poll = useCallback(async (id: number) => {
     try {
       const updated = await fetchApplySession(id);
@@ -83,7 +85,7 @@ export default function ApplyModal({ jobId, jobTitle, company, onClose }: ApplyM
     try {
       const { session: updated, fillResult: result } = await triggerAutofill(session.id);
       setSession(updated);
-      setFillResult(result);
+      setFillHistory((prev) => [...prev, result]);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Autofill failed');
       // Refresh session to get error state
@@ -98,6 +100,7 @@ export default function ApplyModal({ jobId, jobTitle, company, onClose }: ApplyM
   const isError = status === 'error' || !!error;
   const canAutofill = status === 'form_detected' && !filling;
   const isBusy = status === 'opening' || status === 'open' || status === 'filling' || filling;
+  const stepCount = fillHistory.length;
 
   return (
     // Backdrop
@@ -131,13 +134,8 @@ export default function ApplyModal({ jobId, jobTitle, company, onClose }: ApplyM
                 <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
               </svg>
             )}
-            {!isBusy && !isError && status === 'form_detected' && (
+            {!isBusy && !isError && (status === 'form_detected' || status === 'filled') && (
               <div className="w-4 h-4 rounded-full bg-emerald-500 shrink-0" />
-            )}
-            {!isBusy && !isError && status === 'filled' && (
-              <svg className="w-4 h-4 text-emerald-500 shrink-0" fill="none" viewBox="0 0 24 24" strokeWidth={2.5} stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
-              </svg>
             )}
             {isError && (
               <svg className="w-4 h-4 text-red-500 shrink-0" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
@@ -145,7 +143,9 @@ export default function ApplyModal({ jobId, jobTitle, company, onClose }: ApplyM
               </svg>
             )}
             <span className={clsx('text-sm font-medium', STATUS_COLOR[status])}>
-              {STATUS_LABEL[status]}
+              {stepCount > 0 && status === 'form_detected'
+                ? `Step ${stepCount + 1} detected — ready to autofill`
+                : STATUS_LABEL[status]}
             </span>
           </div>
 
@@ -163,8 +163,19 @@ export default function ApplyModal({ jobId, jobTitle, company, onClose }: ApplyM
           {status === 'form_detected' && (
             <div className="mt-2 ml-6 p-3 bg-amber-50 border border-amber-100 rounded-lg">
               <p className="text-xs text-amber-700 leading-relaxed">
-                This form may contain <strong>Yes/No dropdowns</strong> (sponsorship, work authorization, referral, etc.).
-                Autofill will select the most confident answer based on your profile. Anything unclear will be skipped and shown below.
+                This form may contain <strong>Yes/No dropdowns</strong> and custom widgets (sponsorship, work
+                authorization, referral, etc.). Autofill will select the most confident answer based on your
+                profile. Anything unclear will be skipped and shown below.
+              </p>
+            </div>
+          )}
+
+          {/* Filled guidance: watching for next step */}
+          {status === 'filled' && (
+            <div className="mt-2 ml-6 p-3 bg-blue-50 border border-blue-100 rounded-lg">
+              <p className="text-xs text-blue-700 leading-relaxed">
+                Review the fields above, then click <strong>Next</strong> or <strong>Continue</strong> in
+                the browser window. New fields on the next step will be detected automatically.
               </p>
             </div>
           )}
@@ -193,43 +204,50 @@ export default function ApplyModal({ jobId, jobTitle, company, onClose }: ApplyM
           )}
         </div>
 
-        {/* Fill results */}
-        {fillResult && (
-          <div className="px-6 pb-4 space-y-3">
-            {fillResult.filled.length > 0 && (
-              <div>
-                <p className="text-xs font-semibold text-emerald-700 mb-1">
-                  Filled ({fillResult.filled.length})
-                </p>
-                <ul className="space-y-0.5">
-                  {fillResult.filled.map((f) => (
-                    <li key={f} className="flex items-center gap-1.5 text-xs text-gray-700">
-                      <svg className="w-3 h-3 text-emerald-500 shrink-0" fill="none" viewBox="0 0 24 24" strokeWidth={2.5} stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
-                      </svg>
-                      {f}
-                    </li>
-                  ))}
-                </ul>
+        {/* Fill history — one block per autofill step */}
+        {fillHistory.length > 0 && (
+          <div className="px-6 pb-4 space-y-4">
+            {fillHistory.map((result, idx) => (
+              <div key={idx}>
+                {fillHistory.length > 1 && (
+                  <p className="text-xs font-bold text-gray-500 mb-1.5">Step {idx + 1} results</p>
+                )}
+                {result.filled.length > 0 && (
+                  <div className={fillHistory.length > 1 ? 'ml-2' : ''}>
+                    <p className="text-xs font-semibold text-emerald-700 mb-1">
+                      Filled ({result.filled.length})
+                    </p>
+                    <ul className="space-y-0.5">
+                      {result.filled.map((f) => (
+                        <li key={f} className="flex items-center gap-1.5 text-xs text-gray-700">
+                          <svg className="w-3 h-3 text-emerald-500 shrink-0" fill="none" viewBox="0 0 24 24" strokeWidth={2.5} stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
+                          </svg>
+                          {f}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                {result.skipped.length > 0 && (
+                  <div className={clsx(fillHistory.length > 1 ? 'ml-2' : '', result.filled.length > 0 ? 'mt-2' : '')}>
+                    <p className="text-xs font-semibold text-gray-500 mb-1">
+                      Needs manual input ({result.skipped.length})
+                    </p>
+                    <ul className="space-y-0.5">
+                      {result.skipped.map((f) => (
+                        <li key={f} className="flex items-center gap-1.5 text-xs text-gray-400">
+                          <svg className="w-3 h-3 text-gray-300 shrink-0" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M18 12H6" />
+                          </svg>
+                          {f}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
               </div>
-            )}
-            {fillResult.skipped.length > 0 && (
-              <div>
-                <p className="text-xs font-semibold text-gray-500 mb-1">
-                  Needs manual input ({fillResult.skipped.length})
-                </p>
-                <ul className="space-y-0.5">
-                  {fillResult.skipped.map((f) => (
-                    <li key={f} className="flex items-center gap-1.5 text-xs text-gray-400">
-                      <svg className="w-3 h-3 text-gray-300 shrink-0" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" d="M18 12H6" />
-                      </svg>
-                      {f}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
+            ))}
           </div>
         )}
 
@@ -268,7 +286,7 @@ export default function ApplyModal({ jobId, jobTitle, company, onClose }: ApplyM
                   <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" strokeWidth={2.5} stroke="currentColor">
                     <path strokeLinecap="round" strokeLinejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09z" />
                   </svg>
-                  Autofill
+                  {stepCount > 0 ? `Autofill Step ${stepCount + 1}` : 'Autofill'}
                 </>
               )}
             </button>
