@@ -321,27 +321,32 @@ async function getLabelText(page: Page | Frame, inputId: string, inputName: stri
 // ─── Main: detect native fillable fields on page ──────────────────────────────
 
 export async function detectFields(page: Page | Frame): Promise<DetectedField[]> {
-  const inputs = await page.$$eval(
+  // $$eval callback must be pure JS — no TypeScript syntax or closures over outer scope,
+  // because Playwright serialises it via Function.prototype.toString() and eval()s it in
+  // the browser context. Selector generation happens OUTSIDE the callback using cssAttr().
+  const rawInputs = await page.$$eval(
     'input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="reset"]):not([type="image"]), select, textarea',
-    (els) => {
-      // Escape a value for use inside a CSS attribute selector — safe for UUIDs and special chars
-      const escAttr = (s: string) => s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-      return els.map((el) => ({
-        tagName: el.tagName.toLowerCase(),
-        type: el.getAttribute('type') ?? el.tagName.toLowerCase(),
-        id: el.id ?? '',
-        name: el.getAttribute('name') ?? '',
-        autocomplete: el.getAttribute('autocomplete') ?? '',
-        placeholder: (el as HTMLInputElement).placeholder ?? '',
-        // Use attribute selector [id="..."] instead of #id — safe for UUIDs like #0e91fb78-a9f9-4bde-...
-        selector: el.id
-          ? `[id="${escAttr(el.id)}"]`
-          : el.getAttribute('name')
-            ? `[name="${escAttr(el.getAttribute('name') ?? '')}"]`
-            : '',
-      }));
-    },
+    (els) => els.map((el) => ({
+      tagName: el.tagName.toLowerCase(),
+      type: el.getAttribute('type') ?? el.tagName.toLowerCase(),
+      id: el.id ?? '',
+      name: el.getAttribute('name') ?? '',
+      autocomplete: el.getAttribute('autocomplete') ?? '',
+      placeholder: (el as HTMLInputElement).placeholder ?? '',
+    })),
   );
+
+  // Build safe CSS attribute selectors in TypeScript (cssAttr handles UUID ids, special chars)
+  const inputs = rawInputs.map((input) => ({
+    ...input,
+    selector: input.id
+      ? `[id="${cssAttr(input.id)}"]`
+      : input.name
+        ? `[name="${cssAttr(input.name)}"]`
+        : '',
+  }));
+
+  console.log(`[runner] detectFields: raw=${rawInputs.length} with-selector=${inputs.filter((i) => i.selector).length}`);
 
   const detected: DetectedField[] = [];
 
