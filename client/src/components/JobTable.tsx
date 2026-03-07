@@ -74,7 +74,7 @@ function CompanyAvatar({ company }: { company: string }) {
   );
 }
 
-export default function JobTable({ jobs, showAppliedInfo = false }: JobTableProps) {
+export default function JobTable({ jobs, showAppliedInfo = false, onMarkApplied }: JobTableProps) {
   const [applyTarget, setApplyTarget] = useState<JobPosting | null>(null);
 
   return (
@@ -125,6 +125,7 @@ export default function JobTable({ jobs, showAppliedInfo = false }: JobTableProp
           jobTitle={applyTarget.title}
           company={applyTarget.company}
           onClose={() => setApplyTarget(null)}
+          onMarkApplied={onMarkApplied}
         />
       )}
     </>

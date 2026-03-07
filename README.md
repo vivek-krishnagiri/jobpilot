@@ -337,6 +337,7 @@ JobPilot uses `node:sqlite` (built-in `DatabaseSync` API) which requires **Node.
 | Phase 3.7 | Complete | Expanded profile + yes/no dropdown autofill + EEO opt-in + cover letter |
 | Phase 4.1 | Complete | Workday multi-step autofill + ARIA combobox + radio group support |
 | Phase 5 | Complete | Multi-user authentication — login/signup, per-user profiles, cookie sessions |
+| Phase 4.2 | Complete | Autofill accuracy improvements — UUID selector fix, full-name matching, open-ended field detection, post-apply confirmation |
 | Phase 4 | Planned | Smart matching, scoring, email alerts |
 
 ---

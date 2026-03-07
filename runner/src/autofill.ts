@@ -45,7 +45,7 @@ export interface Profile {
 
 // ─── Extended profile key (includes virtual keys for exp/edu) ─────────────────
 
-type ProfileKey = keyof Profile | 'exp_company' | 'exp_title' | 'edu_school' | 'edu_degree' | 'edu_field';
+type ProfileKey = keyof Profile | 'full_name' | 'exp_company' | 'exp_title' | 'edu_school' | 'edu_degree' | 'edu_field';
 
 // ─── Field → profile key mapping ──────────────────────────────────────────────
 
@@ -70,6 +70,11 @@ const FIELD_PATTERNS: FieldPattern[] = [
     profileKey: 'preferred_name',
     labels: ['preferred name', 'nickname', 'goes by'],
     attrs: ['preferred_name', 'preferredname', 'nickname'],
+  },
+  {
+    profileKey: 'full_name',
+    labels: ['full name', 'legal name', 'complete name', 'full legal name', 'applicant name', 'candidate name', 'name'],
+    attrs: ['fullname', 'full_name', 'legalname', 'legal_name', 'candidatename'],
   },
   {
     profileKey: 'email',
@@ -265,6 +270,16 @@ function cssAttr(s: string): string {
   return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 }
 
+// Strip filler words so "Please enter your full name" → "full name" for cleaner matching
+function normalizeLabel(label: string): string {
+  return label
+    .toLowerCase()
+    .replace(/\b(please|enter|provide|type|input|your|the|a|an|here|below|us)\b/g, ' ')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 // ─── Helper: get label text for an input ─────────────────────────────────────
 
 async function getLabelText(page: Page | Frame, inputId: string, inputName: string): Promise<string> {
@@ -308,20 +323,24 @@ async function getLabelText(page: Page | Frame, inputId: string, inputName: stri
 export async function detectFields(page: Page | Frame): Promise<DetectedField[]> {
   const inputs = await page.$$eval(
     'input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="reset"]):not([type="image"]), select, textarea',
-    (els) =>
-      els.map((el) => ({
+    (els) => {
+      // Escape a value for use inside a CSS attribute selector — safe for UUIDs and special chars
+      const escAttr = (s: string) => s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+      return els.map((el) => ({
         tagName: el.tagName.toLowerCase(),
         type: el.getAttribute('type') ?? el.tagName.toLowerCase(),
         id: el.id ?? '',
         name: el.getAttribute('name') ?? '',
         autocomplete: el.getAttribute('autocomplete') ?? '',
         placeholder: (el as HTMLInputElement).placeholder ?? '',
+        // Use attribute selector [id="..."] instead of #id — safe for UUIDs like #0e91fb78-a9f9-4bde-...
         selector: el.id
-          ? `#${el.id}`
+          ? `[id="${escAttr(el.id)}"]`
           : el.getAttribute('name')
-            ? `[name="${el.getAttribute('name')}"]`
+            ? `[name="${escAttr(el.getAttribute('name') ?? '')}"]`
             : '',
-      })),
+      }));
+    },
   );
 
   const detected: DetectedField[] = [];
@@ -330,6 +349,7 @@ export async function detectFields(page: Page | Frame): Promise<DetectedField[]>
     if (!input.selector) continue;
 
     const labelText = await getLabelText(page, input.id, input.name).catch(() => '');
+    const normalizedLabel = normalizeLabel(labelText);
     const attrLower = `${input.name} ${input.id} ${input.autocomplete}`.toLowerCase();
 
     // File inputs: check label for cover letter vs resume
@@ -349,9 +369,9 @@ export async function detectFields(page: Page | Frame): Promise<DetectedField[]>
     // Match against all pattern lists in priority order
     let matched: ProfileKey | null = null;
 
-    // 1. Core field patterns
+    // 1. Core field patterns — check raw label AND normalized label (strips filler words)
     for (const pattern of FIELD_PATTERNS) {
-      const labelMatch = pattern.labels.some((l) => labelText.includes(l));
+      const labelMatch = pattern.labels.some((l) => labelText.includes(l) || normalizedLabel === l || normalizedLabel.startsWith(l + ' ') || (normalizedLabel.includes(l) && l.length > 4));
       const attrMatch = pattern.attrs.some((a) => attrLower.includes(a));
       if (labelMatch || attrMatch) {
         matched = pattern.profileKey;
@@ -362,7 +382,7 @@ export async function detectFields(page: Page | Frame): Promise<DetectedField[]>
     // 2. Boolean yes/no patterns (selects and text)
     if (!matched) {
       for (const pattern of BOOLEAN_PATTERNS) {
-        const labelMatch = pattern.labels.some((l) => labelText.includes(l));
+        const labelMatch = pattern.labels.some((l) => labelText.includes(l) || normalizedLabel.includes(l));
         const attrMatch = pattern.attrs.some((a) => attrLower.includes(a));
         if (labelMatch || attrMatch) {
           matched = pattern.profileKey;
@@ -374,7 +394,7 @@ export async function detectFields(page: Page | Frame): Promise<DetectedField[]>
     // 3. EEO patterns
     if (!matched) {
       for (const pattern of EEO_PATTERNS) {
-        const labelMatch = pattern.labels.some((l) => labelText.includes(l));
+        const labelMatch = pattern.labels.some((l) => labelText.includes(l) || normalizedLabel.includes(l));
         const attrMatch = pattern.attrs.some((a) => attrLower.includes(a));
         if (labelMatch || attrMatch) {
           matched = pattern.profileKey;
@@ -479,10 +499,11 @@ export async function detectCustomFields(page: Page | Frame): Promise<DetectedFi
   for (const { selector, label, widgetType } of rawWidgets) {
     if (!label) continue;
     const labelLower = label.toLowerCase();
+    const normalizedWidgetLabel = normalizeLabel(labelLower);
     let matched: ProfileKey | null = null;
 
     for (const pattern of allPatterns) {
-      if (pattern.labels.some((l) => labelLower.includes(l))) {
+      if (pattern.labels.some((l) => labelLower.includes(l) || normalizedWidgetLabel.includes(l))) {
         matched = pattern.profileKey;
         break;
       }
@@ -507,6 +528,7 @@ export async function detectCustomFields(page: Page | Frame): Promise<DetectedFi
 export interface FillResult {
   filled: string[];
   skipped: string[];
+  draftNeeded: string[];
   total: number;
 }
 
@@ -740,6 +762,10 @@ async function fillRadioGroup(
 // ─── Resolve virtual exp/edu keys from JSON ───────────────────────────────────
 
 function resolveVirtualKey(key: string, profile: Profile): string | null {
+  if (key === 'full_name') {
+    const parts = [profile.first_name, profile.last_name].filter(Boolean);
+    return parts.length > 0 ? parts.join(' ') : null;
+  }
   if (VIRTUAL_EXP_KEYS.has(key)) {
     try {
       const items = JSON.parse(profile.experience_json ?? '[]') as Array<Record<string, string>>;
@@ -771,13 +797,21 @@ export async function fillFields(
 ): Promise<FillResult> {
   const filled: string[] = [];
   const skipped: string[] = [];
+  const draftNeeded: string[] = [];
+
+  // Labels that suggest open-ended questions needing a written answer
+  const QUESTION_WORDS = /\b(why|how|describe|tell|explain|what|share|elaborate|summary|cover|additional|comments|message|statement)\b/;
 
   for (const field of fields) {
     const key = field.profileKey;
 
-    // Unmapped
+    // Unmapped — textareas and question-like text fields go to draftNeeded
     if (!key) {
-      skipped.push(`${field.label} (unmapped)`);
+      if (field.type === 'textarea' || (field.type === 'text' && QUESTION_WORDS.test(field.label))) {
+        draftNeeded.push(`${field.label} (open-ended — fill manually)`);
+      } else {
+        skipped.push(`${field.label} (unmapped)`);
+      }
       continue;
     }
 
@@ -789,7 +823,7 @@ export async function fillFields(
 
     // Resolve the value
     let profileValue: string | null = null;
-    if (VIRTUAL_EXP_KEYS.has(key) || VIRTUAL_EDU_KEYS.has(key)) {
+    if (key === 'full_name' || VIRTUAL_EXP_KEYS.has(key) || VIRTUAL_EDU_KEYS.has(key)) {
       profileValue = resolveVirtualKey(key, profile);
     } else {
       const raw = (profile as unknown as Record<string, unknown>)[key];
@@ -901,5 +935,5 @@ export async function fillFields(
     setTimeout(() => div.remove(), 8000);
   }, filled.length).catch(() => { /* ignore if page closed */ });
 
-  return { filled, skipped, total: fields.length };
+  return { filled, skipped, draftNeeded, total: fields.length };
 }

@@ -109,6 +109,7 @@ export interface ApplySession {
 export interface FillResult {
   filled: string[];
   skipped: string[];
+  draftNeeded: string[];
   total: number;
 }
 

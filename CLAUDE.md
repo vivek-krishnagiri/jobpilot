@@ -17,6 +17,7 @@
 | Phase 3.7 | ✅ Complete | Expanded profile (25 new fields) + yes/no dropdown autofill + EEO opt-in + cover letter |
 | Phase 4.1 | ✅ Complete | Workday multi-step autofill + ARIA combobox/radio support + field fingerprinting |
 | Phase 5 | ✅ Complete | Multi-user auth (login/signup, per-user profiles, cookie sessions, route protection) |
+| Phase 4.2 | ✅ Complete | CSS selector bug fix, `full_name` virtual key, `normalizeLabel`, `draftNeeded`, post-apply confirmation |
 | Phase 4 | Planned | Smart matching, scoring, alerts |
 
 ---
@@ -483,3 +484,4 @@ openSession() → page.goto() → initial detectFieldsAllFrames()
 | 2026-03-04 | Phase 3.7: 25 new profile columns (address/work-auth/referral/EEO/cover-letter) + BOOLEAN_PATTERNS + EEO_PATTERNS + fillSelectSmart/fillSelectYesNo + virtual exp/edu keys + Settings accordion UI + ApplyModal dropdown hint |
 | 2026-03-04 | Phase 4.1: detectCustomFields (combobox + radio_group ARIA widgets) + fillCombobox + fillRadioGroup + field fingerprinting + multi-step watcher (never stops at filled) + stepCount + fillHistory in modal + POLLING_STATUSES expanded |
 | 2026-03-05 | Phase 5: Multi-user auth — users table, bcryptjs password hashing, in-memory session store, jp_session cookie, requireAuth preHandler, per-user profile + apply_sessions, login/signup/logout/me endpoints, LoginPage, AuthContext, RequireAuth, apiFetch wrapper, Layout user menu |
+| 2026-03-05 | Phase 4.2: Fixed CSS selector bug (UUID IDs → `[id="..."]` attribute selector), added `full_name` virtual key + normalizeLabel (strips filler words), added `draftNeeded` to FillResult for open-ended fields, post-apply "Did you apply?" confirmation flow in ApplyModal, wired onMarkApplied through JobTable |

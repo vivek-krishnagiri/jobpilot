@@ -38,13 +38,15 @@ interface ApplyModalProps {
   jobTitle: string;
   company: string;
   onClose: () => void;
+  onMarkApplied?: (jobId: number) => Promise<void>;
 }
 
-export default function ApplyModal({ jobId, jobTitle, company, onClose }: ApplyModalProps) {
-  const [session, setSession]         = useState<ApplySession | null>(null);
-  const [fillHistory, setFillHistory] = useState<FillResult[]>([]);
-  const [filling, setFilling]         = useState(false);
-  const [error, setError]             = useState<string | null>(null);
+export default function ApplyModal({ jobId, jobTitle, company, onClose, onMarkApplied }: ApplyModalProps) {
+  const [session, setSession]               = useState<ApplySession | null>(null);
+  const [fillHistory, setFillHistory]       = useState<FillResult[]>([]);
+  const [filling, setFilling]               = useState(false);
+  const [error, setError]                   = useState<string | null>(null);
+  const [confirmState, setConfirmState]     = useState<'idle' | 'ask' | 'marking' | 'done' | 'declined'>('idle');
 
   // Start session immediately on mount
   useEffect(() => {
@@ -86,6 +88,8 @@ export default function ApplyModal({ jobId, jobTitle, company, onClose }: ApplyM
       const { session: updated, fillResult: result } = await triggerAutofill(session.id);
       setSession(updated);
       setFillHistory((prev) => [...prev, result]);
+      // Prompt after autofill completes — ask if they successfully applied
+      if (onMarkApplied) setConfirmState('ask');
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Autofill failed');
       // Refresh session to get error state
@@ -94,6 +98,22 @@ export default function ApplyModal({ jobId, jobTitle, company, onClose }: ApplyM
     } finally {
       setFilling(false);
     }
+  };
+
+  const handleConfirmYes = async () => {
+    if (!onMarkApplied) return;
+    setConfirmState('marking');
+    try {
+      await onMarkApplied(jobId);
+      setConfirmState('done');
+      setTimeout(onClose, 1500);
+    } catch {
+      setConfirmState('ask');
+    }
+  };
+
+  const handleConfirmNo = () => {
+    setConfirmState('declined');
   };
 
   const status = session?.status ?? 'created';
@@ -229,8 +249,25 @@ export default function ApplyModal({ jobId, jobTitle, company, onClose }: ApplyM
                     </ul>
                   </div>
                 )}
-                {result.skipped.length > 0 && (
+                {(result.draftNeeded ?? []).length > 0 && (
                   <div className={clsx(fillHistory.length > 1 ? 'ml-2' : '', result.filled.length > 0 ? 'mt-2' : '')}>
+                    <p className="text-xs font-semibold text-amber-600 mb-1">
+                      Write-in answers needed ({(result.draftNeeded ?? []).length})
+                    </p>
+                    <ul className="space-y-0.5">
+                      {(result.draftNeeded ?? []).map((f) => (
+                        <li key={f} className="flex items-center gap-1.5 text-xs text-amber-700">
+                          <svg className="w-3 h-3 text-amber-400 shrink-0" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M16.862 4.487l1.687-1.688a1.875 1.875 0 112.652 2.652L10.582 16.07a4.5 4.5 0 01-1.897 1.13L6 18l.8-2.685a4.5 4.5 0 011.13-1.897l8.932-8.931zm0 0L19.5 7.125" />
+                          </svg>
+                          {f}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                {result.skipped.length > 0 && (
+                  <div className={clsx(fillHistory.length > 1 ? 'ml-2' : '', (result.filled.length > 0 || (result.draftNeeded ?? []).length > 0) ? 'mt-2' : '')}>
                     <p className="text-xs font-semibold text-gray-500 mb-1">
                       Needs manual input ({result.skipped.length})
                     </p>
@@ -248,6 +285,50 @@ export default function ApplyModal({ jobId, jobTitle, company, onClose }: ApplyM
                 )}
               </div>
             ))}
+
+            {/* Post-apply confirmation */}
+            {confirmState === 'ask' && (
+              <div className="mt-2 p-3 bg-indigo-50 border border-indigo-100 rounded-lg">
+                <p className="text-xs font-semibold text-indigo-800 mb-2">
+                  Did you apply to this job successfully?
+                </p>
+                <div className="flex gap-2">
+                  <button
+                    onClick={handleConfirmYes}
+                    className="px-3 py-1.5 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg transition-colors"
+                  >
+                    Yes, I applied!
+                  </button>
+                  <button
+                    onClick={handleConfirmNo}
+                    className="px-3 py-1.5 text-xs font-medium text-gray-600 bg-white border border-gray-200 hover:bg-gray-50 rounded-lg transition-colors"
+                  >
+                    Not yet
+                  </button>
+                </div>
+              </div>
+            )}
+            {confirmState === 'marking' && (
+              <p className="text-xs text-indigo-600 mt-2 flex items-center gap-1.5">
+                <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                </svg>
+                Marking as applied…
+              </p>
+            )}
+            {confirmState === 'done' && (
+              <p className="text-xs font-semibold text-emerald-700 mt-2">
+                Moved to Current Jobs!
+              </p>
+            )}
+            {confirmState === 'declined' && (
+              <div className="mt-2 p-3 bg-amber-50 border border-amber-100 rounded-lg">
+                <p className="text-xs text-amber-700">
+                  Make sure to come back and submit once you're ready. This job stays in Browse Jobs.
+                </p>
+              </div>
+            )}
           </div>
         )}
 
