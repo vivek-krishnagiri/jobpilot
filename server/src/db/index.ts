@@ -219,7 +219,19 @@ db.exec(`
 // 3. Add user_id to apply_sessions
 addColumnIfMissing('apply_sessions', 'user_id', 'INTEGER');
 
-// 4. Seed default user and attach any unowned profile row
+// 4. Persistent session store
+db.exec(`
+  CREATE TABLE IF NOT EXISTS sessions (
+    token      TEXT PRIMARY KEY,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    username   TEXT NOT NULL,
+    expires_at INTEGER NOT NULL
+  );
+`);
+// Clean up expired sessions on startup
+db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(Date.now());
+
+// 5. Seed default user and attach any unowned profile row
 {
   const username = process.env.DEFAULT_USER_USERNAME ?? 'vivek';
   const password = process.env.DEFAULT_USER_PASSWORD ?? 'chess123';

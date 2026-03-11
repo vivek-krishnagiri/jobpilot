@@ -56,7 +56,7 @@ You can also create a new account via the **Sign up** tab.
 
 ## Authentication
 
-JobPilot uses **cookie-based sessions** with bcrypt-hashed passwords. Sessions are stored in memory on the server — a server restart logs everyone out (normal for a local-first tool).
+JobPilot uses **cookie-based sessions** with bcrypt-hashed passwords. Sessions are persisted to SQLite and survive server restarts — you stay logged in across restarts.
 
 - Accounts are created via the **Sign up** tab on the login page
 - Each account has its own private profile, resume, and apply session history
@@ -150,16 +150,18 @@ Autofill matches form fields by label text, `aria-label`, and `name`/`id`/`autoc
 | Field type | Strategy |
 |-----------|---------|
 | Text / email / tel / textarea | `fill()` with profile value |
-| `<select>` — yes/no fields | Smart yes/no option matching (e.g. "No", "N", "false" all match "No") |
-| `<select>` — general dropdowns | Fuzzy text match (exact → starts-with → contains) |
-| `[role="combobox"]` (Workday) | Click trigger → wait for listbox → score `[role="option"]` elements → click best |
-| `[role="radiogroup"]` / `fieldset` | Score radio labels → click best matching radio |
+| `<select>` — yes/no fields | Synonym-matched: "No, I do not require sponsorship" correctly matches profile value `No` |
+| `<select>` — general dropdowns | Centralized scoring: exact → starts-with → contains → token overlap |
+| `[role="combobox"]` (Workday) | Click trigger → wait for listbox → score `[role="option"]` texts in Node.js → click best |
+| `[role="radiogroup"]` / `fieldset` | Extract labels to Node.js → score → click best; works with `<input type="radio">` AND `[role="radio"]` card-style elements |
+| Bare radio groups (shared `name` attr) | Extract labels to Node.js → score → click best match |
+| `aria-haspopup="listbox"` triggers | Treated as combobox — click trigger → wait for listbox → score options |
 | File upload (resume) | `setInputFiles()` with saved resume path |
 | File upload (cover letter) | `setInputFiles()` with saved cover letter path |
 | Native checkbox / radio | **Skipped** — needs manual input |
 | EEO fields | **Skipped unless** you enable EEO autofill in Settings |
 
-Fields that cannot be filled are listed in the **"Needs manual input"** section of the modal with the reason.
+Fields that cannot be filled are listed in the **"Needs manual input"** section of the modal with a reason code (`low_confidence`, `eeo_disabled`, `no_profile_value`, `unmapped`). Filled fields show the actual value that was selected (e.g. "Sponsorship → No", "Race → White (Not Hispanic or Latino)").
 
 ---
 
@@ -316,7 +318,7 @@ Workday, Greenhouse, and Lever load their forms dynamically. After the browser o
 3. Navigate to the form page — the runner will detect it automatically
 
 **401 Unauthorized / redirected to login unexpectedly**
-The server session store is in-memory — a server restart clears all sessions. Just log in again. This is normal for local use.
+Sessions are stored in SQLite and survive server restarts. If you see a 401, your session likely expired (7-day TTL). Just log in again.
 
 **"Username already taken" on signup**
 Username comparison is case-insensitive. Try a different name.
@@ -338,6 +340,9 @@ JobPilot uses `node:sqlite` (built-in `DatabaseSync` API) which requires **Node.
 | Phase 4.1 | Complete | Workday multi-step autofill + ARIA combobox + radio group support |
 | Phase 5 | Complete | Multi-user authentication — login/signup, per-user profiles, cookie sessions |
 | Phase 4.2 | Complete | Autofill accuracy improvements — UUID selector fix, full-name matching, open-ended field detection, post-apply confirmation |
+| Phase 4.3 | Complete | Bare radio group autofill, EEO/radio grouping (one result per question), modal scrolling fix |
+| Phase 4.4 | Complete | ARIA radio element clicking, `aria-haspopup="listbox"` combobox detection, applied jobs auto-removed from Browse Jobs |
+| Phase 4.5 | Complete | Synonym matching + confidence scoring — verbose dropdown options (e.g. "White (Not Hispanic or Latino)") now correctly matched from short profile values |
 | Phase 4 | Planned | Smart matching, scoring, email alerts |
 
 ---

@@ -11,6 +11,7 @@ export async function fetchJobs(filters: Partial<FilterState>): Promise<JobPosti
   if (filters.source)    params.set('source', filters.source);
   if (filters.sortBy)    params.set('sortBy', filters.sortBy);
   params.set('activeOnly', String(filters.activeOnly ?? true));
+  params.set('appliedOnly', 'false'); // Browse Jobs never shows applied jobs
 
   const res = await apiFetch(`${API}/jobs?${params}`);
   if (!res.ok) throw new Error(`Failed to fetch jobs: ${res.statusText}`);

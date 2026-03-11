@@ -129,10 +129,10 @@ export default function ApplyModal({ jobId, jobTitle, company, onClose, onMarkAp
       onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
     >
       {/* Modal card */}
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md mx-4 overflow-hidden">
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md mx-4 flex flex-col max-h-[85vh] overflow-hidden">
 
-        {/* Header */}
-        <div className="flex items-start justify-between px-6 pt-5 pb-4 border-b border-gray-100">
+        {/* Header — always visible */}
+        <div className="flex items-start justify-between px-6 pt-5 pb-4 border-b border-gray-100 shrink-0">
           <div>
             <h2 className="text-base font-semibold text-gray-900">Apply with JobPilot</h2>
             <p className="text-sm text-gray-500 mt-0.5">{jobTitle} · {company}</p>
@@ -144,6 +144,9 @@ export default function ApplyModal({ jobId, jobTitle, company, onClose, onMarkAp
             ×
           </button>
         </div>
+
+        {/* Scrollable body — status + fill history */}
+        <div className="flex-1 overflow-y-auto min-h-0">
 
         {/* Status */}
         <div className="px-6 py-4">
@@ -238,14 +241,20 @@ export default function ApplyModal({ jobId, jobTitle, company, onClose, onMarkAp
                       Filled ({result.filled.length})
                     </p>
                     <ul className="space-y-0.5">
-                      {result.filled.map((f) => (
-                        <li key={f} className="flex items-center gap-1.5 text-xs text-gray-700">
-                          <svg className="w-3 h-3 text-emerald-500 shrink-0" fill="none" viewBox="0 0 24 24" strokeWidth={2.5} stroke="currentColor">
-                            <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
-                          </svg>
-                          {f}
-                        </li>
-                      ))}
+                      {result.filled.map((f) => {
+                        const arrowIdx = f.indexOf(' → ');
+                        const label  = arrowIdx >= 0 ? f.slice(0, arrowIdx) : f;
+                        const detail = arrowIdx >= 0 ? f.slice(arrowIdx + 3).replace(/\s*\[.*\]$/, '') : '';
+                        return (
+                          <li key={f} className="flex items-center gap-1.5 text-xs text-gray-700">
+                            <svg className="w-3 h-3 text-emerald-500 shrink-0" fill="none" viewBox="0 0 24 24" strokeWidth={2.5} stroke="currentColor">
+                              <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
+                            </svg>
+                            <span>{label}</span>
+                            {detail && <span className="text-gray-400 truncate">→ {detail}</span>}
+                          </li>
+                        );
+                      })}
                     </ul>
                   </div>
                 )}
@@ -272,14 +281,20 @@ export default function ApplyModal({ jobId, jobTitle, company, onClose, onMarkAp
                       Needs manual input ({result.skipped.length})
                     </p>
                     <ul className="space-y-0.5">
-                      {result.skipped.map((f) => (
-                        <li key={f} className="flex items-center gap-1.5 text-xs text-gray-400">
-                          <svg className="w-3 h-3 text-gray-300 shrink-0" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
-                            <path strokeLinecap="round" strokeLinejoin="round" d="M18 12H6" />
-                          </svg>
-                          {f}
-                        </li>
-                      ))}
+                      {result.skipped.map((f) => {
+                        const dashIdx = f.indexOf(' — ');
+                        const label  = dashIdx >= 0 ? f.slice(0, dashIdx) : f;
+                        const reason = dashIdx >= 0 ? f.slice(dashIdx + 3) : '';
+                        return (
+                          <li key={f} className="flex items-center gap-1.5 text-xs text-gray-400">
+                            <svg className="w-3 h-3 text-gray-300 shrink-0" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
+                              <path strokeLinecap="round" strokeLinejoin="round" d="M18 12H6" />
+                            </svg>
+                            <span>{label}</span>
+                            {reason && <span className="text-gray-300 italic text-xs">{reason}</span>}
+                          </li>
+                        );
+                      })}
                     </ul>
                   </div>
                 )}
@@ -332,8 +347,10 @@ export default function ApplyModal({ jobId, jobTitle, company, onClose, onMarkAp
           </div>
         )}
 
-        {/* Actions */}
-        <div className="flex items-center justify-between px-6 py-4 border-t border-gray-100 bg-gray-50/60">
+        </div>{/* end scrollable body */}
+
+        {/* Actions — always visible */}
+        <div className="flex items-center justify-between px-6 py-4 border-t border-gray-100 bg-gray-50/60 shrink-0">
           <p className="text-xs text-gray-400">
             Forms are never submitted automatically.
           </p>

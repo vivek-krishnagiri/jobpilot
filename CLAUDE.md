@@ -18,6 +18,9 @@
 | Phase 4.1 | ✅ Complete | Workday multi-step autofill + ARIA combobox/radio support + field fingerprinting |
 | Phase 5 | ✅ Complete | Multi-user auth (login/signup, per-user profiles, cookie sessions, route protection) |
 | Phase 4.2 | ✅ Complete | CSS selector bug fix, `full_name` virtual key, `normalizeLabel`, `draftNeeded`, post-apply confirmation |
+| Phase 4.3 | ✅ Complete | Bare radio group autofill, EEO/radio grouping, modal scrolling fix |
+| Phase 4.4 | ✅ Complete | ARIA radio element support, `aria-haspopup="listbox"` detection, applied-job Browse Jobs exclusion |
+| Phase 4.5 | ✅ Complete | Answer normalization + synonym matching + confidence-scored option picker for dropdowns/radios |
 | Phase 4 | Planned | Smart matching, scoring, alerts |
 
 ---
@@ -83,7 +86,7 @@ Job Application Automation/
 │   └── src/
 │       ├── index.ts          # Register: cors (credentials:true), multipart, global auth hook, all routes
 │       ├── auth/
-│       │   ├── session.ts    # In-memory session store (Map<token,{userId,username,expiresAt}>)
+│       │   ├── session.ts    # SQLite-backed session store (createSession/getSession/deleteSession)
 │       │   └── middleware.ts # FastifyRequest.user augmentation + requireAuth preHandler + populateUser
 │       ├── db/index.ts       # Schema: job_postings, sources, sync_runs,
 │       │                     #         users, applicant_profile (per-user), apply_sessions
@@ -139,7 +142,7 @@ Job Application Automation/
 
 ### Authentication (Phase 5)
 - **Password hashing:** `bcryptjs` (pure-JS, no native compilation) — cost factor 10
-- **Session store:** in-memory `Map<token, {userId, username, expiresAt}>` with 7-day TTL — resets on server restart (acceptable for local-first tool)
+- **Session store:** SQLite-backed `sessions` table (`token`, `user_id`, `username`, `expires_at`); 7-day TTL; survives server restarts. Expired sessions cleaned up on startup.
 - **Cookie:** `jp_session`, `HttpOnly`, `SameSite=Lax`, `Max-Age=604800` (7 days)
 - **Cookie parsing:** manual from `request.headers.cookie` (no @fastify/cookie needed)
 - **CORS:** `credentials: true` + explicit origin list (`localhost:5173`) — required for cross-origin cookies
@@ -293,9 +296,36 @@ Pattern categories (in priority order):
 2. **`BOOLEAN_PATTERNS`** — yes/no fields (sponsorship, authorization, referral, edtech, renaissance, relocation)
 3. **`EEO_PATTERNS`** — demographic fields (gender, race, veteran, disability, orientation, transgender)
 
+### Phase 4.5 — Normalization + Synonym Matching + Confidence Scoring
+
+All option-matching logic now runs in Node.js (never inside `page.evaluate()`):
+
+**`normalizeText(s)`** — lowercases, strips unicode punctuation (`'`, `"`, `–`, `—`), strips all non-alphanumeric punctuation, removes stopwords (`i`, `the`, `a`, `an`, `or`, `to`, `do`, `not`, `will`, `you`, `now`, `in`, `future`, `that`, `is`, `am`, `are`), collapses whitespace.
+
+**`SYNONYM_MAP`** — maps `profileKey → canonical-value → option-text fragments`.  12 profileKey entries: `requires_sponsorship`, `legally_authorized`, `referred_by_employee`, `willing_to_relocate`, `worked_in_edtech`, `previously_worked_renaissance`, `eeo_gender`, `eeo_race_ethnicity`, `eeo_veteran`, `eeo_disability`, `eeo_sexual_orientation`, `eeo_transgender`.
+
+**`scoreOption(optionText, profileValue, profileKey)`** — returns 0–100 or -1 (conflict):
+- Synonym map match: 95 (exact), 85 (starts-with), 75 (contains)
+- Conflict detection: -1 if option matches a *different* canonical value for the same profileKey
+- Generic: exact=100, starts-with=75, contains=55, reverse-starts-with=45
+- Token overlap: up to 30
+
+**`chooseBestOption(options, profileValue, profileKey)`** — applies `CONFIDENCE_THRESHOLD=40`; ambiguity guard skips when top-2 are within 10 pts and best < 85.
+
+**All 5 fill helpers** now return `string | null` (selected option text or null):
+- `fillSelectSmart` / `fillSelectYesNo` — extract native `<option>` text to Node.js
+- `fillCombobox` — extracts `[role="option"]` text to Node.js; uses `'keyboard' in page` guard for `keyboard.press('Escape')` (Frame compat)
+- `fillRadioGroup` / `fillBareRadioGroup` — extract radio labels to Node.js
+
+**`fillFields()` result strings:**
+- Filled: `"Label → Selected Value [widgetType]"` e.g. `"Sponsorship → No [select]"`
+- Skipped: `"Label — reason"` e.g. `"Race/ethnicity — low_confidence"`, `"Gender — eeo_disabled"`, `"Title — no_profile_value"`, `"Unknown — unmapped"`
+
+**`ApplyModal.tsx`** — filled items split on ` → ` to show label + muted value; skipped items split on ` — ` to show label + italic muted reason.
+
 ### Select filling strategies
-- **`fillSelectYesNo(locator, 'Yes'|'No')`** — scores each option against yes/no variants; picks highest scorer
-- **`fillSelectSmart(locator, desiredText)`** — normalizes option text, scores exact(100) / starts-with(80) / contains(60) / reverse-starts-with(50)
+- **`fillSelectYesNo(locator, 'Yes'|'No', profileKey)`** — delegates to `fillSelectSmart`; SYNONYM_MAP covers all yes/no variants
+- **`fillSelectSmart(locator, desiredText, profileKey)`** — extracts options to Node.js; scores via `chooseBestOption`; returns selected text or null
 
 ### EEO opt-in guard
 EEO fields are skipped unless `profile.allow_eeo_autofill === '1'`. Reason shown in skipped results.
@@ -485,3 +515,7 @@ openSession() → page.goto() → initial detectFieldsAllFrames()
 | 2026-03-04 | Phase 4.1: detectCustomFields (combobox + radio_group ARIA widgets) + fillCombobox + fillRadioGroup + field fingerprinting + multi-step watcher (never stops at filled) + stepCount + fillHistory in modal + POLLING_STATUSES expanded |
 | 2026-03-05 | Phase 5: Multi-user auth — users table, bcryptjs password hashing, in-memory session store, jp_session cookie, requireAuth preHandler, per-user profile + apply_sessions, login/signup/logout/me endpoints, LoginPage, AuthContext, RequireAuth, apiFetch wrapper, Layout user menu |
 | 2026-03-05 | Phase 4.2: Fixed CSS selector bug (UUID IDs → `[id="..."]` attribute selector), added `full_name` virtual key + normalizeLabel (strips filler words), added `draftNeeded` to FillResult for open-ended fields, post-apply "Did you apply?" confirmation flow in ApplyModal, wired onMarkApplied through JobTable |
+| 2026-03-07 | Phase 4.3: Bare radio group detection (radios sharing name attr outside formal containers), excluded radio/checkbox from detectFields, fillBareRadioGroup function, modal max-h scrollable layout (header+footer pinned) |
+| 2026-03-07 | Phase 4.4: fillRadioGroup handles [role="radio"] ARIA elements (not just native inputs); detectCustomFields now counts native+ARIA radios for ≥2 threshold; added aria-haspopup="listbox" detection as combobox; server/client jobs filter — Browse Jobs excludes applied_flag=1 jobs |
+| 2026-03-07 | Auth fix: session store migrated from in-memory Map to SQLite sessions table — sessions now survive server restarts |
+| 2026-03-11 | Phase 4.5: centralised normalizeText + SYNONYM_MAP (12 profileKeys) + scoreOption + chooseBestOption (confidence threshold 40, ambiguity guard); all 5 fill helpers refactored to return string\|null using Node.js-side scoring; fillFields uses richer "Label → Value [type]" / "Label — reason" strings; ApplyModal renders label+detail / label+reason split UI |

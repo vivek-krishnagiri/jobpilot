@@ -262,7 +262,7 @@ export interface DetectedField {
   type: string;              // text | email | tel | select | file | textarea | checkbox | radio
   profileKey: ProfileKey | null;
   value: string | null;      // profile value that would fill it, null if unmapped
-  widgetType?: 'native' | 'combobox' | 'radio_group';
+  widgetType?: 'native' | 'combobox' | 'radio_group' | 'bare_radio_group';
 }
 
 // Escape a value for use inside a CSS attribute selector (e.g. [for="..."])
@@ -325,7 +325,7 @@ export async function detectFields(page: Page | Frame): Promise<DetectedField[]>
   // because Playwright serialises it via Function.prototype.toString() and eval()s it in
   // the browser context. Selector generation happens OUTSIDE the callback using cssAttr().
   const rawInputs = await page.$$eval(
-    'input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="reset"]):not([type="image"]), select, textarea',
+    'input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="reset"]):not([type="image"]):not([type="radio"]):not([type="checkbox"]), select, textarea',
     (els) => els.map((el) => ({
       tagName: el.tagName.toLowerCase(),
       type: el.getAttribute('type') ?? el.tagName.toLowerCase(),
@@ -429,7 +429,7 @@ export async function detectFields(page: Page | Frame): Promise<DetectedField[]>
 
 export async function detectCustomFields(page: Page | Frame): Promise<DetectedField[]> {
   // Inject data-jp-cb / data-jp-rg attributes and collect label + index metadata
-  type RawWidget = { selector: string; label: string; widgetType: 'combobox' | 'radio_group' };
+  type RawWidget = { selector: string; label: string; widgetType: 'combobox' | 'radio_group' | 'bare_radio_group' };
 
   const rawWidgets = await page.evaluate((): RawWidget[] => {
     function getLabel(el: Element): string {
@@ -479,11 +479,36 @@ export async function detectCustomFields(page: Page | Frame): Promise<DetectedFi
       });
     });
 
-    // Radio groups: role="radiogroup" or fieldset with ≥2 radios
+    // aria-haspopup="listbox" triggers not already covered by [role="combobox"]
+    // (e.g. Lever / custom ATS dropdown buttons that reveal a listbox portal)
+    const listboxTriggers = document.querySelectorAll('[aria-haspopup="listbox"]:not([role="combobox"])');
+    let lbtIndex = 0;
+    listboxTriggers.forEach((el) => {
+      let ancestor: Element | null = el;
+      let hidden = false;
+      while (ancestor) {
+        if (ancestor.getAttribute('aria-hidden') === 'true') { hidden = true; break; }
+        ancestor = ancestor.parentElement;
+      }
+      if (hidden) return;
+
+      const label = getLabel(el);
+      if (!label) { lbtIndex++; return; }
+
+      el.setAttribute('data-jp-lbt', String(lbtIndex));
+      results.push({ selector: `[data-jp-lbt="${lbtIndex}"]`, label, widgetType: 'combobox' });
+      lbtIndex++;
+    });
+
+    // Radio groups: role="radiogroup" or fieldset with ≥2 radios.
+    // Count both native <input type="radio"> AND ARIA [role="radio"] elements
+    // (Greenhouse EEO / Ashby-style cards use [role="radio"] divs).
     const rgEls = document.querySelectorAll('[role="radiogroup"], fieldset');
     let rgIndex = 0;
     rgEls.forEach((el) => {
-      if (el.querySelectorAll('input[type="radio"]').length < 2) return;
+      const nativeRadios = el.querySelectorAll('input[type="radio"]').length;
+      const ariaRadios   = el.querySelectorAll('[role="radio"]').length;
+      if (nativeRadios + ariaRadios < 2) return;
       el.setAttribute('data-jp-rg', String(rgIndex));
       const legend = el.querySelector('legend');
       const label = legend?.textContent?.trim() ?? getLabel(el);
@@ -495,13 +520,86 @@ export async function detectCustomFields(page: Page | Frame): Promise<DetectedFi
       rgIndex++;
     });
 
+    // ── Bare radio groups ─────────────────────────────────────────────────────
+    // Radios NOT inside a formal [role="radiogroup"] or fieldset, grouped by name.
+    // selector is stored as the raw name attribute; TypeScript converts it to a
+    // proper CSS selector after page.evaluate returns.
+    const processedBareNames = new Set();
+    document.querySelectorAll('input[type="radio"]').forEach((radio) => {
+      const name = radio.getAttribute('name');
+      if (!name || processedBareNames.has(name)) return;
+      if (radio.closest('[role="radiogroup"]') || radio.closest('fieldset')) return;
+
+      const siblings = Array.from(document.querySelectorAll('input[type="radio"]'))
+        .filter((r) => r.getAttribute('name') === name
+          && !r.closest('[role="radiogroup"]')
+          && !r.closest('fieldset'));
+
+      if (siblings.length < 2) return;
+      processedBareNames.add(name);
+
+      let groupLabel = '';
+
+      // 1. aria-labelledby / aria-label on immediate parent
+      const par = siblings[0].parentElement;
+      if (par) {
+        const lby = par.getAttribute('aria-labelledby');
+        if (lby) {
+          groupLabel = lby.split(/\s+/)
+            .map((id) => document.getElementById(id)?.textContent?.trim() ?? '')
+            .join(' ').trim();
+        }
+        if (!groupLabel) {
+          const al = par.getAttribute('aria-label');
+          if (al && al.trim()) groupLabel = al.trim();
+        }
+      }
+
+      // 2. Preceding sibling of the first radio (text element, no radio children)
+      if (!groupLabel) {
+        let prev: Element | null = siblings[0].previousElementSibling;
+        while (prev && !groupLabel) {
+          if (!prev.querySelector('input[type="radio"]')) {
+            const t = prev.textContent?.trim();
+            if (t && t.length > 0 && t.length < 200) groupLabel = t;
+          }
+          prev = prev.previousElementSibling;
+        }
+      }
+
+      // 3. Preceding sibling of the parent element
+      if (!groupLabel && par) {
+        let prev: Element | null = par.previousElementSibling;
+        while (prev && !groupLabel) {
+          if (!prev.querySelector('input[type="radio"]')) {
+            const t = prev.textContent?.trim();
+            if (t && t.length > 0 && t.length < 200) groupLabel = t;
+          }
+          prev = prev.previousElementSibling;
+        }
+      }
+
+      // 4. Fall back to humanized name attribute
+      if (!groupLabel) groupLabel = name.replace(/[-_]/g, ' ').trim();
+
+      // selector = raw name value; converted to CSS selector after evaluate
+      results.push({ selector: name, label: groupLabel, widgetType: 'bare_radio_group' });
+    });
+
     return results;
   });
+
+  // Build proper CSS attribute selectors for bare radio groups
+  const processedWidgets = rawWidgets.map((w) =>
+    w.widgetType === 'bare_radio_group'
+      ? { ...w, selector: `input[type="radio"][name="${cssAttr(w.selector)}"]` }
+      : w,
+  );
 
   const detected: DetectedField[] = [];
   const allPatterns = [...FIELD_PATTERNS, ...BOOLEAN_PATTERNS, ...EEO_PATTERNS];
 
-  for (const { selector, label, widgetType } of rawWidgets) {
+  for (const { selector, label, widgetType } of processedWidgets) {
     if (!label) continue;
     const labelLower = label.toLowerCase();
     const normalizedWidgetLabel = normalizeLabel(labelLower);
@@ -537,10 +635,167 @@ export interface FillResult {
   total: number;
 }
 
-// ─── Shared normalizer ────────────────────────────────────────────────────────
+// ─── Answer normalization ─────────────────────────────────────────────────────
+//
+// Converts raw option/profile text into a comparable canonical form:
+// lowercase, strip punctuation, remove common filler words.
 
-function norm(s: string): string {
-  return s.toLowerCase().replace(/[^a-z0-9]/g, ' ').trim();
+function normalizeText(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/[\u2018\u2019\u201c\u201d\u2013\u2014]/g, ' ') // smart quotes / dashes
+    .replace(/[^a-z0-9\s]/g, ' ')                             // strip all punctuation
+    .replace(/\b(i|the|a|an|or|to|do|not|will|you|now|in|future|that|is|am|are)\b/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// ─── Synonym map ──────────────────────────────────────────────────────────────
+//
+// profileKey → canonical profile value → list of option text fragments
+// that indicate a match. The conflict-detection code in scoreOption uses this
+// map to reject options that match a DIFFERENT canonical value.
+
+const SYNONYM_MAP: Record<string, Record<string, string[]>> = {
+  requires_sponsorship: {
+    'no':  ['no', 'n', 'false', '0', 'no i do not', 'do not require', 'no sponsorship', 'no immigration', 'not require', 'not need'],
+    'yes': ['yes', 'y', 'true', '1', 'yes i will', 'will require', 'need sponsorship', 'require immigration'],
+  },
+  legally_authorized: {
+    'yes': ['yes', 'y', 'true', '1', 'i am authorized', 'yes i am', 'authorized to work', 'legally authorized', 'legally eligible'],
+    'no':  ['no', 'n', 'false', '0', 'i am not authorized', 'not authorized'],
+  },
+  referred_by_employee: {
+    'yes': ['yes', 'i was referred', 'employee referral', 'referred by'],
+    'no':  ['no', 'not referred', 'i was not referred'],
+  },
+  willing_to_relocate: {
+    'yes': ['yes', 'willing', 'open to relocation', 'i am willing', 'can relocate'],
+    'no':  ['no', 'not willing', 'not open', 'cannot relocate', 'unable to relocate'],
+  },
+  worked_in_edtech: {
+    'yes': ['yes', 'i have worked', 'previously worked'],
+    'no':  ['no', 'i have not', 'have not worked'],
+  },
+  previously_worked_renaissance: {
+    'yes': ['yes', 'i have worked', 'previously worked'],
+    'no':  ['no', 'i have not', 'have not worked'],
+  },
+  eeo_gender: {
+    'male':      ['male', 'man', 'he him'],
+    'female':    ['female', 'woman', 'she her'],
+    'nonbinary': ['non binary', 'nonbinary', 'genderqueer', 'gender non'],
+    'decline':   ['decline', 'prefer not', 'not disclose', 'not wish', 'not say'],
+  },
+  eeo_race_ethnicity: {
+    'white':              ['white', 'caucasian'],
+    'black':              ['black', 'african american'],
+    'asian':              ['asian'],
+    'hispanic_or_latino': ['hispanic', 'latino', 'latina', 'latinx'],
+    'native':             ['american indian', 'alaska native', 'native american'],
+    'pacific_islander':   ['pacific islander', 'native hawaiian', 'pacific'],
+    'two_or_more':        ['two or more', 'multiracial', 'mixed', 'multiple'],
+    'decline':            ['decline', 'prefer not', 'not wish', 'not disclose'],
+  },
+  eeo_veteran: {
+    'yes':     ['protected veteran', 'i identify', 'i am a veteran', 'yes veteran', 'active duty'],
+    'no':      ['not a protected veteran', 'i am not a protected', 'no i am not'],
+    'decline': ['decline', 'prefer not', 'not wish', 'not disclose'],
+  },
+  eeo_disability: {
+    'yes':     ['yes i have', 'have a disability', 'i do have', 'disability yes'],
+    'no':      ['no i do not', 'do not have a disability', 'no disability', 'none'],
+    'decline': ['decline', 'prefer not', 'not wish', 'not disclose'],
+  },
+  eeo_sexual_orientation: {
+    'straight':  ['straight', 'heterosexual'],
+    'gay':       ['gay', 'lesbian', 'homosexual'],
+    'bisexual':  ['bisexual', 'bi'],
+    'decline':   ['decline', 'prefer not', 'not wish', 'not disclose', 'not say'],
+  },
+  eeo_transgender: {
+    'yes':     ['yes', 'transgender', 'trans'],
+    'no':      ['no', 'not transgender', 'cisgender'],
+    'decline': ['decline', 'prefer not', 'not wish'],
+  },
+};
+
+// ─── Centralized option scoring ───────────────────────────────────────────────
+
+const CONFIDENCE_THRESHOLD = 40; // minimum score required to auto-select
+
+/**
+ * Score how well `optionText` matches `profileValue` given the question's
+ * profile key. Returns 0-100 (higher = better), or -1 for a conflicting match.
+ */
+function scoreOption(optionText: string, profileValue: string, profileKey: string | null): number {
+  const normOpt = normalizeText(optionText);
+  const normVal = normalizeText(profileValue);
+  if (!normOpt || !normVal) return 0;
+
+  // 1. Synonym-map lookup (category-aware, highest precision)
+  if (profileKey && SYNONYM_MAP[profileKey]) {
+    const categoryMap = SYNONYM_MAP[profileKey];
+    const canon = profileValue.toLowerCase().trim();
+    const synonyms = categoryMap[canon] ?? categoryMap[normVal];
+
+    if (synonyms) {
+      for (const syn of synonyms) {
+        const ns = normalizeText(syn);
+        if (!ns) continue;
+        if (normOpt === ns)          return 95;
+        if (normOpt.startsWith(ns)) return 85;
+        if (normOpt.includes(ns))   return 75;
+      }
+    }
+
+    // Conflict: option matches a DIFFERENT canonical value → reject outright
+    for (const [canon2, syns] of Object.entries(categoryMap)) {
+      if (canon2 === canon || canon2 === normVal) continue;
+      for (const syn of syns) {
+        const ns = normalizeText(syn);
+        if (ns && ns.length > 2 && (normOpt === ns || normOpt.startsWith(ns))) return -1;
+      }
+    }
+  }
+
+  // 2. Generic text scoring (no category map available)
+  if (normOpt === normVal)                                return 100;
+  if (normOpt.startsWith(normVal) && normVal.length > 2) return 75;
+  if (normOpt.includes(normVal)   && normVal.length > 3) return 55;
+  if (normVal.startsWith(normOpt) && normOpt.length > 2) return 45;
+
+  // 3. Token overlap (partial match fallback)
+  const optTokens = new Set(normOpt.split(' ').filter((t) => t.length > 2));
+  const valTokens = normVal.split(' ').filter((t) => t.length > 2);
+  if (valTokens.length > 0) {
+    const overlap = valTokens.filter((t) => optTokens.has(t)).length;
+    if (overlap > 0) return Math.round(30 * overlap / valTokens.length);
+  }
+  return 0;
+}
+
+/**
+ * Pick the best option from a list, applying confidence threshold and
+ * ambiguity guard. Returns null if no confident match found.
+ */
+function chooseBestOption(
+  options: Array<{ v?: string; t: string }>,
+  profileValue: string,
+  profileKey: string | null,
+): { value?: string; text: string } | null {
+  const scored = options
+    .map((o) => ({ ...o, score: scoreOption(o.t, profileValue, profileKey) }))
+    .filter((o) => o.score > 0)
+    .sort((a, b) => b.score - a.score);
+
+  if (scored.length === 0) return null;
+  const best = scored[0];
+  if (best.score < CONFIDENCE_THRESHOLD) return null;
+  // Ambiguity: two options within 10 pts of each other, neither is clearly dominant
+  if (scored.length >= 2 && (best.score - scored[1].score) < 10 && best.score < 85) return null;
+
+  return { value: best.v, text: best.t };
 }
 
 // ─── Native <select> helpers ──────────────────────────────────────────────────
@@ -548,220 +803,180 @@ function norm(s: string): string {
 async function fillSelectSmart(
   locator: ReturnType<Page['locator']>,
   desiredText: string,
+  profileKey: string | null = null,
   timeout = 2000,
-): Promise<boolean> {
+): Promise<string | null> {
   const options = await locator.evaluate((el) =>
     Array.from((el as HTMLSelectElement).options).map((o) => ({ v: o.value, t: o.text.trim() })),
-  );
+  ) as Array<{ v: string; t: string }>;
 
-  const target = norm(desiredText);
-  const scored = options.map((o) => {
-    const n = norm(o.t);
-    if (n === target) return { ...o, score: 100 };
-    if (n.startsWith(target)) return { ...o, score: 80 };
-    if (n.includes(target)) return { ...o, score: 60 };
-    if (target.startsWith(n) && n.length > 2) return { ...o, score: 50 };
-    return { ...o, score: 0 };
-  }).filter((o) => o.score > 0).sort((a, b) => b.score - a.score);
-
-  if (!scored.length) return false;
-  await locator.selectOption({ value: scored[0].v }, { timeout });
-  return true;
-}
-
-function yesScore(n: string): number {
-  if (n === 'yes') return 3;
-  if (n === 'y' || n === '1' || n === 'true') return 2;
-  if (n.startsWith('yes')) return 1;
-  return 0;
-}
-
-function noScore(n: string): number {
-  if (n === 'no') return 3;
-  if (n === 'n' || n === '0' || n === 'false') return 2;
-  if (n.startsWith('no')) return 1;
-  return 0;
+  const winner = chooseBestOption(options, desiredText, profileKey);
+  if (!winner) return null;
+  await locator.selectOption({ value: winner.value! }, { timeout });
+  return winner.text;
 }
 
 async function fillSelectYesNo(
   locator: ReturnType<Page['locator']>,
   yesNo: 'Yes' | 'No',
+  profileKey: string | null = null,
   timeout = 2000,
-): Promise<boolean> {
-  const options = await locator.evaluate((el) =>
-    Array.from((el as HTMLSelectElement).options).map((o) => ({ v: o.value, t: o.text.trim() })),
-  );
-
-  const scoreFn = yesNo === 'Yes' ? yesScore : noScore;
-  const best = options
-    .map((o) => ({ ...o, score: scoreFn(norm(o.t)) }))
-    .filter((o) => o.score > 0)
-    .sort((a, b) => b.score - a.score)[0];
-
-  if (!best) return false;
-  await locator.selectOption({ value: best.v }, { timeout });
-  return true;
+): Promise<string | null> {
+  // Delegate to fillSelectSmart — SYNONYM_MAP entries cover all yes/no variants
+  return fillSelectSmart(locator, yesNo, profileKey, timeout);
 }
 
 // ─── ARIA combobox helper ─────────────────────────────────────────────────────
 //
 // Workday uses [role="combobox"] divs with a portal [role="listbox"] / [role="option"].
-// Strategy: click trigger → wait for listbox → score visible options → click best.
+// Strategy: click trigger → wait for listbox → extract option texts to Node.js →
+// score with chooseBestOption → click winner by index.
 
 async function fillCombobox(
   page: Page | Frame,
   selector: string,
   desiredText: string,
-  isBoolean: boolean,
+  isBoolean: boolean,          // kept for API compat; scoring is now handled by SYNONYM_MAP
+  profileKey: string | null = null,
   timeout = 3000,
-): Promise<boolean> {
+): Promise<string | null> {
   try {
-    // Open the dropdown
     await page.locator(selector).first().click({ timeout });
+  } catch { return null; }
 
-    // Wait for a listbox to appear (may be in a portal at document root)
-    await page.locator('[role="listbox"]').waitFor({ state: 'visible', timeout }).catch(() => {});
-
-    // Score visible [role="option"] elements inside the browser context
-    const bestOptionText = await page.evaluate(
-      (args: { desired: string; isBoolean: boolean }) => {
-        const { desired, isBoolean } = args;
-        const normFn = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, ' ').trim();
-        const yesScoreFn = (n: string) => n === 'yes' ? 3 : (n === 'y' || n === '1' || n === 'true') ? 2 : n.startsWith('yes') ? 1 : 0;
-        const noScoreFn  = (n: string) => n === 'no'  ? 3 : (n === 'n' || n === '0' || n === 'false') ? 2 : n.startsWith('no')  ? 1 : 0;
-
-        const optionEls = Array.from(document.querySelectorAll('[role="option"]')).filter((el) => {
-          const s = window.getComputedStyle(el as HTMLElement);
-          return s.display !== 'none' && s.visibility !== 'hidden';
-        });
-
-        if (!optionEls.length) return null;
-
-        let bestText = '';
-        let bestScore = 0;
-
-        for (const el of optionEls) {
-          const text = el.textContent?.trim() ?? '';
-          if (!text) continue;
-          const n = normFn(text);
-          let score = 0;
-
-          if (isBoolean) {
-            const targetIsYes = normFn(desired) === 'yes';
-            score = targetIsYes ? yesScoreFn(n) : noScoreFn(n);
-          } else {
-            const target = normFn(desired);
-            if (n === target) score = 100;
-            else if (n.startsWith(target)) score = 80;
-            else if (n.includes(target)) score = 60;
-            else if (target.startsWith(n) && n.length > 2) score = 50;
-          }
-
-          if (score > bestScore) { bestScore = score; bestText = text; }
-        }
-
-        return bestScore > 0 ? bestText : null;
-      },
-      { desired: desiredText, isBoolean },
-    ) as string | null;
-
-    if (!bestOptionText) {
-      // Close dropdown without selecting
-      await page.locator(selector).first().press('Escape').catch(() => {});
-      return false;
-    }
-
-    // Click the best option
-    await page.locator('[role="option"]', { hasText: bestOptionText }).first().click({ timeout });
-    return true;
-
+  try {
+    await page.locator('[role="listbox"]').waitFor({ state: 'visible', timeout });
   } catch {
-    await page.locator(selector).first().press('Escape').catch(() => {});
-    return false;
+    if ('keyboard' in page) await (page as Page).keyboard.press('Escape').catch(() => {});
+    return null;
   }
+
+  // Extract option texts to Node.js (no scoring in browser context)
+  const options = await page.evaluate(() =>
+    Array.from(document.querySelectorAll('[role="option"]'))
+      .map((el, idx) => ({ idx, text: (el as HTMLElement).textContent?.trim() ?? '' }))
+      .filter((o) => o.text),
+  ) as Array<{ idx: number; text: string }>;
+
+  const mapped = options.map((o) => ({ v: String(o.idx), t: o.text }));
+  const winner = chooseBestOption(mapped, desiredText, profileKey);
+
+  if (!winner) {
+    if ('keyboard' in page) await (page as Page).keyboard.press('Escape').catch(() => {});
+    return null;
+  }
+
+  try {
+    await page.locator('[role="option"]').nth(Number(winner.value)).click({ timeout });
+    return winner.text;
+  } catch { return null; }
 }
 
 // ─── Radio group helper ───────────────────────────────────────────────────────
 //
 // Handles [role="radiogroup"] or fieldset containers with ≥2 radio inputs.
-// Scores radio labels against the desired value and clicks the best match.
+// Labels are extracted to Node.js then scored by chooseBestOption.
 
 async function fillRadioGroup(
   page: Page | Frame,
   selector: string,
   desiredText: string,
-  isBoolean: boolean,
+  isBoolean: boolean,          // kept for API compat
+  profileKey: string | null = null,
   timeout = 2000,
-): Promise<boolean> {
-  try {
-    // Find the best radio index within the container
-    const radioIndex = await page.evaluate(
-      (args: { selector: string; desired: string; isBoolean: boolean }) => {
-        const { selector, desired, isBoolean } = args;
-        const normFn = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, ' ').trim();
-        const yesScoreFn = (n: string) => n === 'yes' ? 3 : (n === 'y' || n === '1' || n === 'true') ? 2 : n.startsWith('yes') ? 1 : 0;
-        const noScoreFn  = (n: string) => n === 'no'  ? 3 : (n === 'n' || n === '0' || n === 'false') ? 2 : n.startsWith('no')  ? 1 : 0;
+): Promise<string | null> {
+  // Extract radio option labels to Node.js (no scoring in browser)
+  const options = await page.evaluate((sel) => {
+    const container = document.querySelector(sel);
+    if (!container) return [];
+    const results: Array<{ index: number; text: string; isAria: boolean; radioId: string }> = [];
 
-        const container = document.querySelector(selector);
-        if (!container) return -1;
-
-        const radios = Array.from(container.querySelectorAll('input[type="radio"]'));
-        let bestIndex = -1;
-        let bestScore = 0;
-
-        radios.forEach((radio, i) => {
-          const id = radio.id;
-          const labelEl = (id ? document.querySelector(`label[for="${id}"]`) : null)
-            ?? radio.closest('label')
-            ?? radio.parentElement?.querySelector('label');
-          const labelText = labelEl?.textContent?.trim()
-            ?? radio.getAttribute('aria-label')
-            ?? radio.getAttribute('value')
-            ?? '';
-          if (!labelText) return;
-
-          const n = normFn(labelText);
-          let score = 0;
-
-          if (isBoolean) {
-            const targetIsYes = normFn(desired) === 'yes';
-            score = targetIsYes ? yesScoreFn(n) : noScoreFn(n);
-          } else {
-            const target = normFn(desired);
-            if (n === target) score = 100;
-            else if (n.startsWith(target)) score = 80;
-            else if (n.includes(target)) score = 60;
-            else if (target.startsWith(n) && n.length > 2) score = 50;
-          }
-
-          if (score > bestScore) { bestScore = score; bestIndex = i; }
-        });
-
-        return bestIndex;
-      },
-      { selector, desired: desiredText, isBoolean },
-    ) as number;
-
-    if (radioIndex < 0) return false;
-
-    const radioLocator = page.locator(`${selector} input[type="radio"]`).nth(radioIndex);
-
-    // Try clicking associated label first (more reliable on styled radio buttons)
-    const radioId = await radioLocator.getAttribute('id').catch(() => null);
-    if (radioId) {
-      const labelLocator = page.locator(`label[for="${radioId}"]`);
-      if (await labelLocator.count() > 0) {
-        await labelLocator.first().click({ timeout });
-        return true;
-      }
+    const natives = Array.from(container.querySelectorAll('input[type="radio"]'));
+    if (natives.length > 0) {
+      natives.forEach((radio, idx) => {
+        const r = radio as HTMLInputElement;
+        let text = '';
+        if (r.id) {
+          const lbl = document.querySelector('label[for="' + r.id + '"]');
+          if (lbl) text = lbl.textContent?.trim() ?? '';
+        }
+        if (!text) { const cl = r.closest('label'); if (cl) text = cl.textContent?.trim() ?? ''; }
+        if (!text) text = r.getAttribute('aria-label') ?? r.value ?? '';
+        results.push({ index: idx, text, isAria: false, radioId: r.id ?? '' });
+      });
+      return results;
     }
 
-    await radioLocator.click({ timeout });
-    return true;
+    Array.from(container.querySelectorAll('[role="radio"]')).forEach((el, idx) => {
+      const e = el as HTMLElement;
+      results.push({ index: idx, text: e.getAttribute('aria-label') ?? e.textContent?.trim() ?? '', isAria: true, radioId: '' });
+    });
+    return results;
+  }, selector) as Array<{ index: number; text: string; isAria: boolean; radioId: string }>;
 
-  } catch {
-    return false;
-  }
+  const winner = chooseBestOption(options.map((o) => ({ v: String(o.index), t: o.text })), desiredText, profileKey);
+  if (!winner) return null;
+
+  const idx = Number(winner.value);
+  const opt = options[idx];
+  try {
+    if (opt.isAria) {
+      await page.locator(`${selector} [role="radio"]`).nth(idx).click({ timeout });
+    } else if (opt.radioId) {
+      try { await page.locator(`label[for="${cssAttr(opt.radioId)}"]`).first().click({ timeout }); }
+      catch { await page.locator(`${selector} input[type="radio"]`).nth(idx).click({ timeout }); }
+    } else {
+      await page.locator(`${selector} input[type="radio"]`).nth(idx).click({ timeout });
+    }
+    return winner.text;
+  } catch { return null; }
+}
+
+// ─── Bare radio group helper ──────────────────────────────────────────────────
+//
+// Handles radios sharing a [name] attribute but NOT inside a formal
+// [role="radiogroup"] or <fieldset>. The selector is a full CSS attribute
+// selector: input[type="radio"][name="..."]
+
+async function fillBareRadioGroup(
+  page: Page | Frame,
+  radioSelector: string,
+  desiredText: string,
+  isBoolean: boolean,          // kept for API compat
+  profileKey: string | null = null,
+  timeout = 2000,
+): Promise<string | null> {
+  // Extract radio labels to Node.js
+  const options = await page.evaluate((sel) =>
+    Array.from(document.querySelectorAll(sel)).map((radio, idx) => {
+      const r = radio as HTMLInputElement;
+      let text = '';
+      if (r.id) {
+        const lbl = document.querySelector('label[for="' + r.id + '"]');
+        if (lbl) text = lbl.textContent?.trim() ?? '';
+      }
+      if (!text) { const cl = r.closest('label'); if (cl) text = cl.textContent?.trim() ?? ''; }
+      if (!text) text = r.getAttribute('aria-label') ?? r.value ?? '';
+      return { index: idx, text, radioId: r.id ?? '' };
+    }),
+  radioSelector) as Array<{ index: number; text: string; radioId: string }>;
+
+  const winner = chooseBestOption(options.map((o) => ({ v: String(o.index), t: o.text })), desiredText, profileKey);
+  if (!winner) return null;
+
+  const idx = Number(winner.value);
+  const opt = options[idx];
+  try {
+    if (opt.radioId) {
+      const labelLoc = page.locator(`label[for="${cssAttr(opt.radioId)}"]`);
+      if (await labelLoc.count() > 0) {
+        await labelLoc.first().click({ timeout });
+        return winner.text;
+      }
+    }
+    await page.locator(radioSelector).nth(idx).click({ timeout });
+    return winner.text;
+  } catch { return null; }
 }
 
 // ─── Resolve virtual exp/edu keys from JSON ───────────────────────────────────
@@ -815,14 +1030,14 @@ export async function fillFields(
       if (field.type === 'textarea' || (field.type === 'text' && QUESTION_WORDS.test(field.label))) {
         draftNeeded.push(`${field.label} (open-ended — fill manually)`);
       } else {
-        skipped.push(`${field.label} (unmapped)`);
+        skipped.push(`${field.label} — unmapped`);
       }
       continue;
     }
 
     // EEO — skip unless opt-in is enabled
     if (EEO_KEYS.has(key) && profile.allow_eeo_autofill !== '1') {
-      skipped.push(`${field.label} (eeo — toggle is off in profile)`);
+      skipped.push(`${field.label} — eeo_disabled`);
       continue;
     }
 
@@ -836,7 +1051,7 @@ export async function fillFields(
     }
 
     if (!profileValue) {
-      skipped.push(`${field.label} (no value in profile)`);
+      skipped.push(`${field.label} — no_profile_value`);
       continue;
     }
 
@@ -847,11 +1062,11 @@ export async function fillFields(
         const desiredText = isBoolean
           ? (profileValue === 'Yes' || profileValue === 'yes' ? 'Yes' : 'No')
           : profileValue;
-        const ok = await fillCombobox(page, field.selector, desiredText, isBoolean);
-        if (ok) {
-          filled.push(field.label);
+        const selected = await fillCombobox(page, field.selector, desiredText, isBoolean, key);
+        if (selected) {
+          filled.push(`${field.label} → ${selected} [combobox]`);
         } else {
-          skipped.push(`${field.label} (no match in combobox options)`);
+          skipped.push(`${field.label} — low_confidence`);
         }
         continue;
       }
@@ -862,11 +1077,11 @@ export async function fillFields(
         const desiredText = isBoolean
           ? (profileValue === 'Yes' || profileValue === 'yes' ? 'Yes' : 'No')
           : profileValue;
-        const ok = await fillRadioGroup(page, field.selector, desiredText, isBoolean);
-        if (ok) {
-          filled.push(field.label);
+        const selected = await fillRadioGroup(page, field.selector, desiredText, isBoolean, key);
+        if (selected) {
+          filled.push(`${field.label} → ${selected} [radio]`);
         } else {
-          skipped.push(`${field.label} (no match in radio options)`);
+          skipped.push(`${field.label} — low_confidence`);
         }
         continue;
       }
@@ -879,9 +1094,24 @@ export async function fillFields(
         continue;
       }
 
+      // ── Bare radio group (radios sharing a name, no formal container) ─────
+      if (field.widgetType === 'bare_radio_group') {
+        const isBoolean = BOOLEAN_KEYS.has(key);
+        const desiredText = isBoolean
+          ? (profileValue === 'Yes' || profileValue === 'yes' ? 'Yes' : 'No')
+          : profileValue;
+        const selected = await fillBareRadioGroup(page, field.selector, desiredText, isBoolean, key);
+        if (selected) {
+          filled.push(`${field.label} → ${selected} [radio]`);
+        } else {
+          skipped.push(`${field.label} — low_confidence`);
+        }
+        continue;
+      }
+
       // ── Native checkbox / radio — skip ────────────────────────────────────
       if (field.type === 'checkbox' || field.type === 'radio') {
-        skipped.push(`${field.label} (checkbox/radio — needs manual input)`);
+        skipped.push(`${field.label} — unsupported_widget`);
         continue;
       }
 
@@ -889,24 +1119,24 @@ export async function fillFields(
       if (field.type === 'select') {
         const locator = page.locator(field.selector).first();
 
-        // Boolean yes/no fields
+        // Boolean yes/no fields — SYNONYM_MAP has entries for all boolean keys
         if (BOOLEAN_KEYS.has(key)) {
           const yesNo = profileValue === 'Yes' || profileValue === 'yes' ? 'Yes' : 'No';
-          const ok = await fillSelectYesNo(locator, yesNo);
-          if (ok) {
-            filled.push(field.label);
+          const selected = await fillSelectYesNo(locator, yesNo, key);
+          if (selected) {
+            filled.push(`${field.label} → ${selected} [select]`);
           } else {
-            skipped.push(`${field.label} (no yes/no option found in select)`);
+            skipped.push(`${field.label} — low_confidence`);
           }
           continue;
         }
 
         // General smart select
-        const ok = await fillSelectSmart(locator, profileValue);
-        if (ok) {
-          filled.push(field.label);
+        const selected = await fillSelectSmart(locator, profileValue, key);
+        if (selected) {
+          filled.push(`${field.label} → ${selected} [select]`);
         } else {
-          skipped.push(`${field.label} (no match in select options)`);
+          skipped.push(`${field.label} — low_confidence`);
         }
         continue;
       }

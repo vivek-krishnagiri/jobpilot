@@ -66,9 +66,14 @@ export async function jobRoutes(fastify: FastifyInstance) {
       query += ' AND active_flag = 1';
     }
 
-    // Applied-only filter for Current Jobs page
+    // Applied filter:
+    //   appliedOnly=true  → Current Jobs (applied only)
+    //   appliedOnly=false → Browse Jobs (unapplied only)
+    //   omitted           → no filter
     if (appliedOnly === 'true') {
       query += ' AND applied_flag = 1';
+    } else if (appliedOnly === 'false') {
+      query += ' AND applied_flag = 0';
     }
 
     if (search) {
